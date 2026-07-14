@@ -14,6 +14,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
+	"golang.org/x/net/ipv6"
 
 	nberrors "github.com/netbirdio/netbird/client/errors"
 	"github.com/netbirdio/netbird/client/iface/bufsize"
@@ -46,6 +47,11 @@ type Proxy struct {
 	relayedConnMutex sync.Mutex
 	relayedConnStore map[netip.Addr]net.Conn
 	addrs            allocator
+	// batchConnIPv4/IPv6 wrap the raw sockets so the inject path can write a
+	// whole batch of packets with one sendmmsg (WriteBatch) instead of one
+	// WriteTo per packet. Non-nil whenever the matching raw socket is present.
+	batchConnIPv4 *ipv4.PacketConn
+	batchConnIPv6 *ipv6.PacketConn
 
 	ctx       context.Context
 	ctxCancel context.CancelFunc
@@ -69,10 +75,14 @@ func (p *Proxy) Listen() error {
 		return fmt.Errorf("prepare IPv4 raw socket: %w", err)
 	}
 	p.rawConnIPv4 = rawConnIPv4
+	p.batchConnIPv4 = ipv4.NewPacketConn(p.rawConnIPv4)
 
 	p.rawConnIPv6, err = rawsocket.PrepareSenderRawSocketIPv6()
 	if err != nil {
 		log.Warnf("failed to prepare IPv6 raw socket, continuing with IPv4 only: %v", err)
+	}
+	if p.rawConnIPv6 != nil {
+		p.batchConnIPv6 = ipv6.NewPacketConn(p.rawConnIPv6)
 	}
 
 	loopback, err := net.InterfaceByName(loopbackDevice)
