@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"syscall"
 
@@ -53,9 +54,19 @@ type Proxy struct {
 	batchConnIPv4 *ipv4.PacketConn
 	batchConnIPv6 *ipv6.PacketConn
 
+	// batchRead drains several relayed packets from the local WireGuard socket
+	// with one recvmmsg and forwards them back-to-back, cutting the per-packet
+	// syscall and wakeup overhead on the hot send path. Gated by
+	// NB_RELAY_BATCH_READ; the per-packet path stays the default.
+	batchRead bool
+
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 }
+
+// batchReadSize bounds how many packets are drained from the local WireGuard
+// socket per recvmmsg when NB_RELAY_BATCH_READ is set.
+const batchReadSize = 64
 
 // NewProxy creates a proxy for the WireGuard instance listening on wgPort.
 func NewProxy(wgPort int, mtu uint16) *Proxy {
@@ -103,6 +114,7 @@ func (p *Proxy) Listen() error {
 
 	p.ctx, p.ctxCancel = context.WithCancel(context.Background())
 
+	p.batchRead = os.Getenv("NB_RELAY_BATCH_READ") == "true"
 	go p.proxyToRemote()
 	log.Infof("local wg proxy listening on %s:%d", addrRangePrefix, p.proxyPort)
 	return nil
@@ -223,6 +235,10 @@ func (p *Proxy) Free() error {
 // proxyToRemote reads packets from the local WireGuard instance and forwards
 // them to the relayed connection the destination address belongs to.
 func (p *Proxy) proxyToRemote() {
+	if p.batchRead {
+		p.proxyToRemoteBatch()
+		return
+	}
 	buf := make([]byte, p.mtu+bufsize.WGBufferOverhead)
 	for p.ctx.Err() == nil {
 		if err := p.readAndForwardPacket(buf); err != nil {
@@ -234,12 +250,52 @@ func (p *Proxy) proxyToRemote() {
 	}
 }
 
+// proxyToRemoteBatch drains up to batchReadSize packets from the local
+// WireGuard socket with one recvmmsg, each with its control message, and
+// forwards each as readAndForwardPacket does: the destination address names
+// the relayed connection. Draining several packets a call spreads the read
+// syscall and wakeup over the batch on the hot send path.
+func (p *Proxy) proxyToRemoteBatch() {
+	bufSize := int(p.mtu) + bufsize.WGBufferOverhead
+	oobSize := len(ipv4.NewControlMessage(ipv4.FlagDst | ipv4.FlagInterface))
+	msgs := make([]ipv4.Message, batchReadSize)
+	for i := range msgs {
+		msgs[i].Buffers = [][]byte{make([]byte, bufSize)}
+		msgs[i].OOB = make([]byte, oobSize)
+	}
+	var cm ipv4.ControlMessage
+	for p.ctx.Err() == nil {
+		n, err := p.packetConn.ReadBatch(msgs, 0)
+		if err != nil {
+			if p.ctx.Err() != nil {
+				return
+			}
+			log.Errorf("failed to batch read UDP packets from WG: %s", err)
+			continue
+		}
+		for i := 0; i < n; i++ {
+			if err := cm.Parse(msgs[i].OOB[:msgs[i].NN]); err != nil {
+				log.Tracef("dropping packet with an unreadable control message: %s", err)
+				continue
+			}
+			if err := p.forwardPacket(msgs[i].Buffers[0][:msgs[i].N], &cm); err != nil {
+				log.Errorf("failed to proxy packet to remote conn: %s", err)
+			}
+		}
+	}
+}
+
 func (p *Proxy) readAndForwardPacket(buf []byte) error {
 	n, cm, _, err := p.packetConn.ReadFrom(buf)
 	if err != nil {
 		return fmt.Errorf("read UDP packet from WG: %w", err)
 	}
+	return p.forwardPacket(buf[:n], cm)
+}
 
+// forwardPacket sends one packet WireGuard wrote to the proxy to the relayed
+// connection its destination address belongs to.
+func (p *Proxy) forwardPacket(payload []byte, cm *ipv4.ControlMessage) error {
 	if cm == nil {
 		return fmt.Errorf("no control message on packet")
 	}
@@ -265,7 +321,7 @@ func (p *Proxy) readAndForwardPacket(buf []byte) error {
 		return nil
 	}
 
-	if _, err := conn.Write(buf[:n]); err != nil {
+	if _, err := conn.Write(payload); err != nil {
 		return fmt.Errorf("forward local WG packet (%s) to remote relayed conn: %w", dst, err)
 	}
 	return nil
