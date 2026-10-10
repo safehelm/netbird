@@ -12,6 +12,7 @@ import (
 	"github.com/netbirdio/netbird/relay/metrics"
 	"github.com/netbirdio/netbird/relay/server/listener"
 	"github.com/netbirdio/netbird/relay/server/store"
+	"github.com/netbirdio/netbird/shared/relay/dropstat"
 	"github.com/netbirdio/netbird/shared/relay/healthcheck"
 	"github.com/netbirdio/netbird/shared/relay/messages"
 )
@@ -228,6 +229,7 @@ func (p *Peer) handleTransportMsg(msg []byte) {
 
 	n, err := dp.Write(dp.ctx, msg)
 	if err != nil {
+		dropstat.WriteErrors.Add(1)
 		p.log.Errorf("failed to write transport message to: %s", dp.String())
 		return
 	}
