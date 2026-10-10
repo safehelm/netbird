@@ -18,6 +18,7 @@ import (
 	nberrors "github.com/netbirdio/netbird/client/errors"
 	"github.com/netbirdio/netbird/client/iface/bufsize"
 	"github.com/netbirdio/netbird/client/iface/wgproxy/rawsocket"
+	nbnet "github.com/netbirdio/netbird/client/net"
 )
 
 const (
@@ -154,6 +155,7 @@ func (p *Proxy) listenOn(proxyPort int) error {
 	}
 
 	p.conn = udpConn
+	nbnet.SizeRelaySocketBuffers(p.conn)
 	p.packetConn = packetConn
 	return nil
 }
