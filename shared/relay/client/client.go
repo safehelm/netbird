@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,8 +19,8 @@ import (
 	"github.com/netbirdio/netbird/client/netevents/sweep"
 	auth "github.com/netbirdio/netbird/shared/relay/auth/hmac"
 	"github.com/netbirdio/netbird/shared/relay/client/dialer"
-	"github.com/netbirdio/netbird/shared/relay/dropstat"
 	netErr "github.com/netbirdio/netbird/shared/relay/client/dialer/net"
+	"github.com/netbirdio/netbird/shared/relay/dropstat"
 	"github.com/netbirdio/netbird/shared/relay/healthcheck"
 	"github.com/netbirdio/netbird/shared/relay/messages"
 )
@@ -80,7 +82,7 @@ type connContainer struct {
 
 func newConnContainer(log *log.Entry, c *Client, peerID messages.PeerID, instanceURL *RelayAddr) *connContainer {
 	ctx, cancel := context.WithCancel(context.Background())
-	msgChan := make(chan Msg, connChannelSize)
+	msgChan := make(chan Msg, connChannelLen())
 	cn := &Conn{
 		dstID:       peerID,
 		messageChan: msgChan,
@@ -941,4 +943,13 @@ func extractIPLiteral(s string) netip.Addr {
 		return netip.Addr{}
 	}
 	return ip.Unmap()
+}
+
+// connChannelLen is a peer's inbound channel length: connChannelSize, or
+// NB_RELAY_CONN_CHANNEL when set (measurement only, omnuv).
+func connChannelLen() int {
+	if n, err := strconv.Atoi(os.Getenv("NB_RELAY_CONN_CHANNEL")); err == nil && n > 0 {
+		return n
+	}
+	return connChannelSize
 }
