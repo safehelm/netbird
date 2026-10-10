@@ -17,6 +17,7 @@ import (
 	"github.com/netbirdio/netbird/client/netevents/sweep"
 	auth "github.com/netbirdio/netbird/shared/relay/auth/hmac"
 	"github.com/netbirdio/netbird/shared/relay/client/dialer"
+	"github.com/netbirdio/netbird/shared/relay/dropstat"
 	netErr "github.com/netbirdio/netbird/shared/relay/client/dialer/net"
 	"github.com/netbirdio/netbird/shared/relay/healthcheck"
 	"github.com/netbirdio/netbird/shared/relay/messages"
@@ -188,6 +189,7 @@ func (cc *connContainer) writeMsg(msg Msg) {
 
 // dropMsg frees msg, counts the drop, and warns at most once per dropLogInterval.
 func (cc *connContainer) dropMsg(msg Msg) {
+	dropstat.ChannelDrops.Add(1)
 	msg.Free()
 	n := cc.drops.Add(1)
 	now := time.Now().UnixNano()

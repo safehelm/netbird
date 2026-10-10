@@ -346,3 +346,4 @@ replace github.com/mailru/easyjson => github.com/netbirdio/easyjson v0.9.0
 replace github.com/wailsapp/wails/v3 => github.com/netbirdio/wails/v3 v3.0.0-beta.3.0.20260825085513-5f07a01f7a78
 
 tool go.uber.org/mock/mockgen
+replace github.com/quic-go/quic-go => /quic-go-onv
