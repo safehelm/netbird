@@ -17,6 +17,7 @@ import (
 	"github.com/netbirdio/netbird/client/netevents/sweep"
 	auth "github.com/netbirdio/netbird/shared/relay/auth/hmac"
 	"github.com/netbirdio/netbird/shared/relay/client/dialer"
+	"github.com/netbirdio/netbird/shared/relay/dropstat"
 	netErr "github.com/netbirdio/netbird/shared/relay/client/dialer/net"
 	"github.com/netbirdio/netbird/shared/relay/healthcheck"
 	"github.com/netbirdio/netbird/shared/relay/messages"
@@ -124,6 +125,7 @@ func (cc *connContainer) writeMsg(msg Msg) {
 	case <-cc.ctx.Done():
 		msg.Free()
 	default:
+		dropstat.ChannelDrops.Add(1)
 		msg.Free()
 	}
 }
