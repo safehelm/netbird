@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"os"
 	"context"
 	"fmt"
 	"net"
@@ -130,7 +131,11 @@ func (w *WorkerICE) OnNewOffer(remoteOfferAnswer *OfferAnswer) {
 	}
 
 	var preferredCandidateTypes []ice.CandidateType
-	if w.hasRelayOnLocally && remoteOfferAnswer.RelaySrvAddress != "" {
+	// Measurement only (omnuv): with a TURN server named by NB_TEST_TURN, ICE
+	// keeps its relay candidates though both peers have NetBird's relay. As
+	// shipped, two peers that both have the relay never ask a TURN server
+	// for anything, which is why one offered to them was never used.
+	if w.hasRelayOnLocally && remoteOfferAnswer.RelaySrvAddress != "" && os.Getenv("NB_TEST_TURN") == "" {
 		preferredCandidateTypes = icemaker.CandidateTypesP2P()
 	} else {
 		preferredCandidateTypes = icemaker.CandidateTypes()
