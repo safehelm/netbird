@@ -94,6 +94,11 @@ type Manager struct {
 	relayClients      map[string]*RelayTrack
 	relayClientsMutex sync.RWMutex
 
+	// lanes are this peer's further connections to its home relay (lanes.go),
+	// by their number.
+	lanes   map[int]*Client
+	lanesMu sync.Mutex
+
 	onDisconnectedListeners map[string]*list.List
 	onReconnectedListenerFn func()
 	listenerLock            sync.Mutex
@@ -162,6 +167,7 @@ func (m *Manager) Serve() error {
 		go m.reconnectGuard.StartReconnectTrys(m.ctx, nil)
 	} else {
 		m.storeClient(client)
+		go m.connectLanes()
 	}
 
 	go m.listenGuardEvent(m.ctx)
@@ -194,6 +200,9 @@ func (m *Manager) OpenConn(ctx context.Context, serverAddress, peerKey string, s
 	if !foreign {
 		log.Debugf("open peer connection via permanent server: %s", peerKey)
 		netConn, err = m.relayClient.OpenConn(ctx, peerKey)
+		if err == nil {
+			netConn = m.withLanes(netConn, peerKey)
+		}
 	} else {
 		log.Debugf("open peer connection via foreign server: %s", serverAddress)
 		netConn, err = m.openConnVia(ctx, serverAddress, peerKey, serverIP)
@@ -409,6 +418,8 @@ func (m *Manager) openConnOnTrack(ctx context.Context, rt *RelayTrack, peerKey s
 }
 
 func (m *Manager) onServerConnected() {
+	go m.connectLanes()
+
 	m.listenerLock.Lock()
 	defer m.listenerLock.Unlock()
 
