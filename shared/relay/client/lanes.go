@@ -132,6 +132,7 @@ func laneHello(kind byte) []byte {
 }
 
 type lane struct {
+	n     int // its place among the lanes; the first is 0
 	conn  net.Conn
 	q     chan *[]byte
 	ready atomic.Bool // the peer has spoken on it
@@ -165,6 +166,7 @@ func newLaneConn(first net.Conn, entry *log.Entry) *laneConn {
 	ls := []*lane{ln}
 	l.lanes.Store(&ls)
 	l.order.held = make(map[uint64]*[]byte)
+	l.order.wait, l.order.quiet, l.order.window = reorderWait, laneQuiet, reorderWindow
 	return l
 }
 
@@ -181,6 +183,7 @@ func (l *laneConn) addLane(conn net.Conn) {
 	default:
 	}
 	old := *l.lanes.Load()
+	ln.n = len(old)
 	ls := append(append(make([]*lane, 0, len(old)+1), old...), ln)
 	l.lanes.Store(&ls)
 	first := !l.multi.Swap(true)
@@ -223,7 +226,9 @@ func (l *laneConn) onHello(ln *lane, p []byte) {
 		// From now the peer may spread its packets at any moment, and the
 		// first sign of it can be a gap on the first lane: gaps wait from here.
 		l.order.mu.Lock()
-		l.order.spread = true
+		if !l.order.spread {
+			l.order.spread, l.order.began = true, time.Now()
+		}
 		l.order.mu.Unlock()
 	}
 	if p[4] == laneHelloAsk {
@@ -281,7 +286,7 @@ func (l *laneConn) reader(ln *lane, first bool) {
 				l.onHello(ln, p)
 				continue
 			}
-			l.order.push(l, p, !first)
+			l.order.push(l, p, ln.n)
 		}
 	}
 }
@@ -378,10 +383,21 @@ func (l *laneConn) emit(b *[]byte) {
 func (l *laneConn) flushLoop() {
 	t := time.NewTicker(time.Millisecond)
 	defer t.Stop()
+	var ticks int
+	var lost, waited uint64
 	for {
 		select {
 		case <-t.C:
 			l.order.flushStale(l)
+			if ticks++; ticks%2000 == 0 {
+				l.order.mu.Lock()
+				nl, nw := l.order.lost, l.order.waited
+				l.order.mu.Unlock()
+				if nl != lost || nw != waited {
+					l.log.Infof("onv lanes: given up as lost by every lane passing them %d, by the wait running out %d", nl, nw)
+					lost, waited = nl, nw
+				}
+			}
 		case <-l.closed:
 			return
 		}
@@ -414,10 +430,21 @@ func (l *laneConn) SetWriteDeadline(t time.Time) error { return l.first().SetWri
 
 // reorder puts WireGuard's data packets back in the order of their counter.
 // Anything else (a handshake, a cookie) passes at once, as does everything
-// while no packet has come by a lane other than the first: a peer that does
-// not spread its packets is not made to wait for the ones it lost. Its
-// counter is followed all the same, so that the order is known the moment it
-// begins to.
+// while the peer has no further lane: a peer that does not spread its packets
+// is not made to wait for the ones it lost. Its counter is followed all the
+// same, so that the order is known the moment it begins to.
+//
+// **A packet that is late is told from one that is lost.** A peer sends each
+// lane its packets in rising order of counter, and a lane keeps the order it
+// was given. So once every lane that is carrying has delivered a counter
+// above a missing one, the missing one is not on its way by any of them: it
+// was lost, and nothing waits for it. Until then it may still be coming by a
+// slower lane, and what is above it waits. Waiting for a fixed time instead
+// stopped the stream for that time at every loss, which over a transport
+// that loses packets (QUIC's datagrams) cost more than the lanes gave: one
+// stream read 123 to 333 Mbit/s on four such lanes against 334 to 418 on one
+// (omnuv, docs/plans/multi-node-llm.md, 11 October 2026). The time is kept
+// for what the rule cannot see: the end of a burst, and a lane gone quiet.
 type reorder struct {
 	mu      sync.Mutex
 	spread  bool   // the peer has a further lane and may be spreading
@@ -427,10 +454,21 @@ type reorder struct {
 	next    uint64 // the counter expected next
 	held    map[uint64]*[]byte
 	since   time.Time // when the oldest gap began
-	skipped uint64    // gaps given up, for the log
+	began   time.Time // when this session, or the spreading, began
+	laneMax [maxLanes]uint64
+	laneAt  [maxLanes]time.Time // when each lane last delivered a data packet of this session
+	wait    time.Duration       // reorderWait, as it was when the connection was made
+	quiet   time.Duration       // laneQuiet, likewise
+	window  int                 // reorderWindow, likewise
+	lost    uint64              // counters given up because every lane had passed them
+	waited  uint64              // counters given up because the wait ran out
 }
 
-func (r *reorder) push(l *laneConn, p []byte, further bool) {
+// laneQuiet is how long a lane may deliver nothing before the order stops
+// asking it whether it has passed a missing packet.
+var laneQuiet = 100 * time.Millisecond
+
+func (r *reorder) push(l *laneConn, p []byte, lane int) {
 	b := lanePkt(p)
 	if len(p) < wgDataHeader || p[0] != wgData {
 		l.emit(b)
@@ -438,11 +476,12 @@ func (r *reorder) push(l *laneConn, p []byte, further bool) {
 	}
 	idx := binary.LittleEndian.Uint32(p[4:8])
 	ctr := binary.LittleEndian.Uint64(p[8:16])
+	now := time.Now()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if further {
-		r.spread = true
+	if lane > 0 && !r.spread {
+		r.spread, r.began = true, now
 	}
 	if r.have && idx == r.prev && idx != r.idx {
 		l.emit(b)
@@ -451,12 +490,20 @@ func (r *reorder) push(l *laneConn, p []byte, further bool) {
 	if !r.have || idx != r.idx {
 		r.release(l)
 		r.prev, r.idx, r.next, r.have = r.idx, idx, ctr, true
+		r.began = now
+		r.laneMax, r.laneAt = [maxLanes]uint64{}, [maxLanes]time.Time{}
 		// A session counts from nothing, and its first packets may come by
 		// several lanes at once: one seen early in it waits for those before
 		// it. One seen far in (this end began to listen late) does not.
 		if r.spread && ctr < sessionStart {
 			r.next = 0
 		}
+	}
+	if lane < maxLanes {
+		if ctr > r.laneMax[lane] || r.laneAt[lane].IsZero() {
+			r.laneMax[lane] = ctr
+		}
+		r.laneAt[lane] = now
 	}
 	if !r.spread {
 		// Nothing is held, but the counter is followed: when the peer begins
@@ -472,22 +519,106 @@ func (r *reorder) push(l *laneConn, p []byte, further bool) {
 	case ctr == r.next:
 		l.emit(b)
 		r.next++
-		r.drain(l)
 	case ctr < r.next:
 		l.emit(b)
+		return
 	default:
 		if len(r.held) == 0 {
-			r.since = time.Now()
+			r.since = now
 		}
 		r.held[ctr] = b
-		if len(r.held) > reorderWindow {
-			r.skip(l)
-		}
+	}
+	r.settle(l, now)
+	if len(r.held) > r.window {
+		r.skip(l, &r.waited)
 	}
 }
 
-// drain emits what is held from the expected counter on.
-func (r *reorder) drain(l *laneConn) {
+// settle emits what is held and in order, and gives up each missing counter
+// that every carrying lane has passed.
+func (r *reorder) settle(l *laneConn, now time.Time) {
+	moved := false
+	for len(r.held) > 0 {
+		if b, ok := r.held[r.next]; ok {
+			delete(r.held, r.next)
+			l.emit(b)
+			r.next++
+			moved = true
+			continue
+		}
+		passed, ok := r.passedByAll(l, now)
+		if !ok || passed < r.next {
+			break
+		}
+		moved = true
+		// Every carrying lane is past r.next: it is lost. So is everything
+		// up to the lowest packet held, or up to what the slowest lane has
+		// passed, whichever comes first.
+		low := r.lowest()
+		if low > passed+1 {
+			low = passed + 1
+		}
+		r.lost += low - r.next
+		r.next = low
+	}
+	if len(r.held) > 0 && (moved || r.since.IsZero()) {
+		r.since = now
+	}
+	if len(r.held) == 0 {
+		r.since = time.Time{}
+	}
+}
+
+// passedByAll is the highest counter that every lane now carrying has
+// delivered or gone beyond. A lane counts while it is usable and has
+// delivered lately, and every usable lane counts while the session or the
+// spreading is new, since a lane that has not spoken yet may be about to.
+func (r *reorder) passedByAll(l *laneConn, now time.Time) (uint64, bool) {
+	fresh := now.Sub(r.began) < r.quiet
+	var low uint64
+	found := false
+	for i, ln := range *l.lanes.Load() {
+		if i >= maxLanes || !ln.usable() {
+			continue
+		}
+		heard := !r.laneAt[i].IsZero()
+		if !heard {
+			if fresh {
+				return 0, false // it may yet bring what is missing
+			}
+			continue
+		}
+		if now.Sub(r.laneAt[i]) >= r.quiet {
+			continue
+		}
+		if !found || r.laneMax[i] < low {
+			low, found = r.laneMax[i], true
+		}
+	}
+	return low, found
+}
+
+func (r *reorder) lowest() uint64 {
+	first := true
+	var low uint64
+	for c := range r.held {
+		if first || c < low {
+			low, first = c, false
+		}
+	}
+	return low
+}
+
+// skip gives the gap up: the lowest packet held is the next.
+func (r *reorder) skip(l *laneConn, why *uint64) {
+	if len(r.held) == 0 {
+		return
+	}
+	low := r.lowest()
+	if low > r.next {
+		*why += low - r.next
+	}
+	r.next = low
 	for {
 		b, ok := r.held[r.next]
 		if !ok {
@@ -497,39 +628,30 @@ func (r *reorder) drain(l *laneConn) {
 		l.emit(b)
 		r.next++
 	}
-	if len(r.held) > 0 {
-		r.since = time.Now()
-	}
-}
-
-// skip gives the gap up: the lowest packet held is the next.
-func (r *reorder) skip(l *laneConn) {
+	r.since = time.Now()
 	if len(r.held) == 0 {
-		return
+		r.since = time.Time{}
 	}
-	first := true
-	var low uint64
-	for c := range r.held {
-		if first || c < low {
-			low, first = c, false
-		}
-	}
-	r.next = low
-	r.skipped++
-	r.drain(l)
 }
 
 // release emits everything held, lowest first, when a session ends.
 func (r *reorder) release(l *laneConn) {
+	var none uint64
 	for len(r.held) > 0 {
-		r.skip(l)
+		r.skip(l, &none)
 	}
 }
 
+// flushStale gives up a gap that has waited its time, which is what is left
+// when no lane brings anything more: the end of a burst.
 func (r *reorder) flushStale(l *laneConn) {
 	r.mu.Lock()
-	if len(r.held) > 0 && time.Since(r.since) > reorderWait {
-		r.skip(l)
+	if len(r.held) > 0 {
+		now := time.Now()
+		r.settle(l, now)
+		if len(r.held) > 0 && !r.since.IsZero() && now.Sub(r.since) > r.wait {
+			r.skip(l, &r.waited)
+		}
 	}
 	r.mu.Unlock()
 }

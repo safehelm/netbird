@@ -170,6 +170,8 @@ func TestLanesCarryInOrder(t *testing.T) {
 	reorderWait = 10 * time.Second
 	defer func(n int) { reorderWindow = n }(reorderWindow)
 	reorderWindow = 1 << 20
+	defer func(d time.Duration) { laneQuiet = d }(laneQuiet)
+	laneQuiet = 30 * time.Second
 	a, b, _ := linked(3)
 	defer a.Close()
 	defer b.Close()
@@ -260,6 +262,110 @@ func TestALostPacketIsNotWaitedForLong(t *testing.T) {
 	}
 }
 
+// rule sets the waits so that only the rule can release a gap: nothing is
+// given up for time, and no lane goes quiet, within a test.
+func rule(t *testing.T, quiet time.Duration) {
+	t.Helper()
+	w, q := reorderWait, laneQuiet
+	reorderWait, laneQuiet = 30*time.Second, quiet
+	t.Cleanup(func() { reorderWait, laneQuiet = w, q })
+}
+
+// A packet lost on one lane is given up the moment every lane has gone past
+// it, without any wait: here the wait is 30 s and the rest come at once.
+func TestALostPacketIsGivenUpWhenEveryLaneHasPassedIt(t *testing.T) {
+	rule(t, 30*time.Second)
+	a, b, _ := linked(2)
+	defer a.Close()
+	defer b.Close()
+	waitFor(t, "two lanes answered", func() bool { return usable(a) == 2 && usable(b) == 2 })
+	ls := *a.lanes.Load()
+	for _, c := range []uint64{0, 1, 2, 3, 4, 6, 7} { // 5 never comes
+		_, _ = ls[0].conn.Write(data(31, c))
+	}
+	for _, c := range []uint64{8, 9, 10} {
+		_, _ = ls[1].conn.Write(data(31, c))
+	}
+	start := time.Now()
+	got := readN(t, b, 10, 3*time.Second)
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("a packet every lane had passed held the rest for %s", d)
+	}
+	for i, want := range []uint64{0, 1, 2, 3, 4, 6, 7, 8, 9, 10} {
+		if counter(got[i]) != want {
+			t.Fatalf("packet %d has counter %d, want %d", i, counter(got[i]), want)
+		}
+	}
+}
+
+// A packet that is only late is waited for: the lane it is on has not passed
+// it, whatever the others have delivered, so nothing above it is let go.
+func TestALatePacketIsWaitedFor(t *testing.T) {
+	rule(t, 30*time.Second)
+	a, b, _ := linked(2)
+	defer a.Close()
+	defer b.Close()
+	waitFor(t, "two lanes answered", func() bool { return usable(a) == 2 && usable(b) == 2 })
+	ls := *a.lanes.Load()
+	for _, c := range []uint64{0, 1, 2, 3, 4} {
+		_, _ = ls[0].conn.Write(data(32, c))
+	}
+	_ = readN(t, b, 5, 3*time.Second)
+	for _, c := range []uint64{8, 9, 10} { // early, by the other lane
+		_, _ = ls[1].conn.Write(data(32, c))
+	}
+	held := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, lanePktCap)
+		if k, err := b.Read(buf); err == nil {
+			held <- append([]byte(nil), buf[:k]...)
+		}
+	}()
+	select {
+	case p := <-held:
+		t.Fatalf("counter %d was let go though 5 to 7 were still on their way", counter(p))
+	case <-time.After(150 * time.Millisecond):
+	}
+	for _, c := range []uint64{5, 6, 7} {
+		_, _ = ls[0].conn.Write(data(32, c))
+	}
+	first := <-held
+	rest := readN(t, b, 5, 3*time.Second)
+	for i, p := range append([][]byte{first}, rest...) {
+		if counter(p) != uint64(5+i) {
+			t.Fatalf("packet %d after the wait has counter %d, want %d", i, counter(p), 5+i)
+		}
+	}
+}
+
+// A lane that has gone quiet is not asked: a gap on the lane still carrying
+// is given up once the quiet lane has been silent long enough.
+func TestAQuietLaneDoesNotHoldTheOthers(t *testing.T) {
+	rule(t, 60*time.Millisecond)
+	a, b, _ := linked(2)
+	defer a.Close()
+	defer b.Close()
+	waitFor(t, "two lanes answered", func() bool { return usable(a) == 2 && usable(b) == 2 })
+	ls := *a.lanes.Load()
+	for _, c := range []uint64{0, 1, 3, 4} { // 2 never comes, and the second lane says nothing
+		_, _ = ls[0].conn.Write(data(33, c))
+	}
+	time.Sleep(90 * time.Millisecond)  // the second lane has now been silent for longer than a lane may be
+	for _, c := range []uint64{5, 6} { // the first carries on
+		_, _ = ls[0].conn.Write(data(33, c))
+	}
+	start := time.Now()
+	got := readN(t, b, 6, 3*time.Second)
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("a lane that carries nothing held the other for %s", d)
+	}
+	for i, want := range []uint64{0, 1, 3, 4, 5, 6} {
+		if counter(got[i]) != want {
+			t.Fatalf("packet %d has counter %d, want %d", i, counter(got[i]), want)
+		}
+	}
+}
+
 // What is not a data packet (a handshake) is never held, and a new session
 // does not wait for the old one's counters.
 func TestHandshakesAndNewSessionsPass(t *testing.T) {
@@ -268,10 +374,10 @@ func TestHandshakesAndNewSessionsPass(t *testing.T) {
 	defer b.Close()
 	waitFor(t, "two lanes answered", func() bool { return usable(a) == 2 && usable(b) == 2 })
 	ls := *a.lanes.Load()
-	_, _ = ls[1].conn.Write(data(21, 1000)) // the session's first packet seen sets what is expected
-	_, _ = ls[1].conn.Write(data(21, 1002)) // held: 1001 is missing
+	_, _ = ls[1].conn.Write(data(21, 1000))                                                     // the session's first packet seen sets what is expected
+	_, _ = ls[1].conn.Write(data(21, 1002))                                                     // held: 1001 is missing
 	_, _ = ls[0].conn.Write([]byte{1, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9}) // a handshake
-	_, _ = ls[0].conn.Write(data(22, 0))                                                           // a new session
+	_, _ = ls[0].conn.Write(data(22, 0))                                                        // a new session
 	// The two lanes are read by two goroutines, so which of them is first is
 	// not defined; what is, is that all four come out, the held one among them.
 	got := readN(t, b, 4, 2*time.Second)
