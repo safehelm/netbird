@@ -1130,6 +1130,16 @@ func (e *Engine) updateNetbirdConfig(wCfg *mgmProto.NetbirdConfig) error {
 	var stunTurn []*stun.URI
 	stunTurn = append(stunTurn, e.STUNs...)
 	stunTurn = append(stunTurn, e.TURNs...)
+	// Measurement only (omnuv): a TURN server named on this machine, as
+	// "turn:host:port?transport=udp,user,password", where the control plane
+	// hands out none.
+	if parts := strings.SplitN(os.Getenv("NB_TEST_TURN"), ",", 3); len(parts) == 3 {
+		if u, err := stun.ParseURI(parts[0]); err == nil {
+			u.Username, u.Password = parts[1], parts[2]
+			stunTurn = append(stunTurn, u)
+			log.Infof("onv test: a TURN server named by NB_TEST_TURN is offered to ICE: %s", parts[0])
+		}
+	}
 	e.stunTurn.Store(stunTurn)
 
 	if err := e.handleRelayUpdate(wCfg.GetRelay()); err != nil {
