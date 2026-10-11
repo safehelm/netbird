@@ -56,10 +56,14 @@ func (d Dialer) Dial(ctx context.Context, address, serverName string) (net.Conn,
 		Tracer:            connectionTracer(quicURL),
 	}
 
+	// Before the library opens the socket: it reads its own switches then.
+	nbnet.PrepareRelayPacing()
+
 	udpConn, err := nbnet.ListenUDP("udp", &net.UDPAddr{Port: 0})
 	if err != nil {
 		return nil, fmt.Errorf("listen udp: %w", err)
 	}
+	nbnet.PaceRelaySocket(udpConn)
 
 	udpAddr, err := net.ResolveUDPAddr("udp", quicURL)
 	if err != nil {
@@ -74,6 +78,8 @@ func (d Dialer) Dial(ctx context.Context, address, serverName string) (net.Conn,
 		log.Debugf("failed to dial to Relay server via QUIC '%s': %s", quicURL, err)
 		return nil, err
 	}
+	// After the dial: the library sized the socket's buffers when it was handed it.
+	nbnet.BoundPacedRelaySocket(udpConn)
 
 	conn := NewConn(session)
 	return conn, nil
