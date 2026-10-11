@@ -253,9 +253,9 @@ func (p *WGEBPFProxy) forwardBatchPacket(payload []byte, addr net.Addr) {
 		return
 	}
 
-	p.turnConnMutex.Lock()
-	conn, ok := p.turnConnStore[uint16(udpAddr.Port)]
-	p.turnConnMutex.Unlock()
+	p.relayedConnMutex.Lock()
+	conn, ok := p.relayedConnStore[uint16(udpAddr.Port)]
+	p.relayedConnMutex.Unlock()
 	if !ok {
 		if p.ctx.Err() == nil {
 			log.Debugf("turn conn not found by port because conn already has been closed: %d", udpAddr.Port)
