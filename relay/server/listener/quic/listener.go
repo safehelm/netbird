@@ -28,7 +28,7 @@ type Listener struct {
 func (l *Listener) Listen(acceptFn func(conn relaylistener.Conn)) error {
 	quicCfg := &quic.Config{
 		EnableDatagrams:   true,
-		InitialPacketSize: nbRelay.QUICInitialPacketSize,
+		InitialPacketSize: nbRelay.InitialPacketSize(),
 	}
 	listener, err := quic.ListenAddr(l.Address, l.TLSConfig, quicCfg)
 	if err != nil {
