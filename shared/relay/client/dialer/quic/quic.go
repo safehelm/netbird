@@ -52,7 +52,7 @@ func (d Dialer) Dial(ctx context.Context, address, serverName string) (net.Conn,
 		KeepAlivePeriod:   30 * time.Second,
 		MaxIdleTimeout:    4 * time.Minute,
 		EnableDatagrams:   true,
-		InitialPacketSize: nbRelay.QUICInitialPacketSize,
+		InitialPacketSize: nbRelay.InitialPacketSize(),
 		Tracer:            connectionTracer(quicURL),
 	}
 
