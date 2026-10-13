@@ -5,6 +5,7 @@
 package dropstat
 
 import (
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -22,13 +23,27 @@ var QueueDrops atomic.Uint64
 // WriteErrors counts transport messages the relay could not write to their peer.
 var WriteErrors atomic.Uint64
 
+// counts reads every counter, in the order the line names them. The last is
+// the one omnuv's build adds to quic-go's connection
+// (deployment/netbird/quic-go-unprocessed-count.patch in omnuv): packets a
+// connection discarded because its run loop had not taken the ones before.
+func counts() [6]uint64 {
+	return [6]uint64{ChannelDrops.Load(), quic.DiscardedDatagrams.Load(), quic.BlockedDatagramSends.Load(), WriteErrors.Load(), QueueDrops.Load(), quic.DroppedUnprocessedPackets.Load()}
+}
+
+// line is what the log carries. A reader greps for a field by its name, so a
+// new one goes at the end and none is renamed.
+func line(c [6]uint64) string {
+	return fmt.Sprintf("onv dropstat channel_drops=%d quic_rcv_discards=%d quic_send_waits=%d write_errors=%d queue_drops=%d quic_unprocessed_drops=%d", c[0], c[1], c[2], c[3], c[4], c[5])
+}
+
 func init() {
 	go func() {
-		var last [5]uint64
+		var last [6]uint64
 		for range time.Tick(2 * time.Second) {
-			now := [5]uint64{ChannelDrops.Load(), quic.DiscardedDatagrams.Load(), quic.BlockedDatagramSends.Load(), WriteErrors.Load(), QueueDrops.Load()}
+			now := counts()
 			if now != last {
-				log.Infof("onv dropstat channel_drops=%d quic_rcv_discards=%d quic_send_waits=%d write_errors=%d queue_drops=%d", now[0], now[1], now[2], now[3], now[4])
+				log.Info(line(now))
 				last = now
 			}
 		}
