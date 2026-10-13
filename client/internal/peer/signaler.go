@@ -66,6 +66,7 @@ func (s *Signaler) signalOfferAnswer(offerAnswer OfferAnswer, remoteKey string, 
 		RelaySrvAddress: offerAnswer.RelaySrvAddress,
 		RelaySrvIP:      offerAnswer.RelaySrvIP,
 		SessionID:       sessionIDBytes,
+		RelayUDPKey:     offerAnswer.RelayUDPKey,
 	})
 	if err != nil {
 		return err

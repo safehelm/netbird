@@ -122,8 +122,9 @@ type Conn struct {
 	currentConnPriority conntype.ConnPriority
 	opened              bool // this flag is used to prevent close in case of not opened connection
 
-	workerICE   *WorkerICE
-	workerRelay *WorkerRelay
+	workerICE      *WorkerICE
+	workerRelay    *WorkerRelay
+	workerRelayUDP *WorkerRelayUDP
 
 	wgWatcher       *WGWatcher
 	wgWatcherWg     sync.WaitGroup
@@ -137,7 +138,13 @@ type Conn struct {
 
 	wgProxyICE   wgproxy.Proxy
 	wgProxyRelay wgproxy.Proxy
-	handshaker   *Handshaker
+	// wgProxyUDP is the proxy of the plain-UDP relay path. It is set exactly
+	// while currentConnPriority is RelayUDP.
+	wgProxyUDP wgproxy.Proxy
+	// relayServerAddr is the relay the pair is on, as the status shows it,
+	// kept to show again when the pair falls back from the UDP relay.
+	relayServerAddr string
+	handshaker      *Handshaker
 
 	guard *guard.Guard
 	wg    sync.WaitGroup
@@ -252,9 +259,20 @@ func (conn *Conn) open(engineCtx context.Context, firstPacket []byte) error {
 		conn.workerICE = workerICE
 	}
 
-	conn.handshaker = NewHandshaker(conn.Log, conn.config, conn.signaler, conn.workerICE, conn.workerRelay, conn.metricsStages)
+	conn.workerRelayUDP = NewWorkerRelayUDP(conn.ctx, conn.Log, isController(conn.config), conn,
+		func() (string, error) {
+			addr, _, err := conn.relayManager.RelayInstanceAddress()
+			return addr, err
+		}, conn.relayManager.AuthToken)
 
-	conn.handshaker.AddRelayListener(conn.workerRelay.OnNewOffer)
+	conn.handshaker = NewHandshaker(conn.Log, conn.config, conn.signaler, conn.workerICE, conn.workerRelay, conn.metricsStages)
+	conn.handshaker.relayUDPKey = conn.workerRelayUDP.PublicKey
+
+	conn.handshaker.AddRelayListener(func(remoteOfferAnswer *OfferAnswer) {
+		// The UDP relay's worker first: it only records what the peer said.
+		conn.workerRelayUDP.OnNewOffer(remoteOfferAnswer)
+		conn.workerRelay.OnNewOffer(remoteOfferAnswer)
+	})
 	if !forceRelay {
 		conn.handshaker.AddICEListener(conn.workerICE.OnNewOffer)
 	}
@@ -319,6 +337,7 @@ func (conn *Conn) Close(signalToRemote bool) {
 	if conn.workerICE != nil {
 		conn.workerICE.Close()
 	}
+	conn.dropRelayUDPLocked()
 
 	if conn.wgProxyRelay != nil {
 		err := conn.wgProxyRelay.CloseConn()
@@ -463,6 +482,8 @@ func (conn *Conn) onICEConnectionIsReady(priority conntype.ConnPriority, iceConn
 	if conn.wgProxyRelay != nil {
 		conn.wgProxyRelay.Pause()
 	}
+	// A direct path outranks the UDP relay: its attempt and its proxy end here.
+	conn.dropRelayUDPLocked()
 
 	if wgProxy != nil {
 		wgProxy.Work()
@@ -525,6 +546,7 @@ func (conn *Conn) onICEStateDisconnected(sessionChanged bool) {
 		}
 
 		conn.currentConnPriority = conntype.Relay
+		conn.workerRelayUDP.Start()
 	} else {
 		conn.Log.Infof("ICE disconnected, do not switch to Relay. Reset priority to: %s", conntype.None.String())
 		conn.currentConnPriority = conntype.None
@@ -581,11 +603,14 @@ func (conn *Conn) onRelayConnectionIsReady(rci RelayConnInfo) {
 
 	conn.Log.Infof("created new wgProxy for relay connection: %s", wgProxy.EndpointAddr().String())
 
-	if conn.isICEActive() {
+	if conn.isICEActive() || conn.currentConnPriority == conntype.RelayUDP {
 		conn.Log.Debugf("do not switch to relay because current priority is: %s", conn.currentConnPriority.String())
 		conn.setRelayedProxy(wgProxy)
 		conn.statusRelay.SetConnected()
-		conn.updateRelayStatus(rci.relayedConn.RemoteAddr().String(), rci.rosenpassPubKey, time.Now())
+		conn.relayServerAddr = rci.relayedConn.RemoteAddr().String()
+		if conn.currentConnPriority != conntype.RelayUDP {
+			conn.updateRelayStatus(conn.relayServerAddr, rci.rosenpassPubKey, time.Now())
+		}
 		return
 	}
 
@@ -615,9 +640,102 @@ func (conn *Conn) onRelayConnectionIsReady(rci RelayConnInfo) {
 	conn.currentConnPriority = conntype.Relay
 	conn.statusRelay.SetConnected()
 	conn.setRelayedProxy(wgProxy)
-	conn.updateRelayStatus(rci.relayedConn.RemoteAddr().String(), rci.rosenpassPubKey, updateTime)
+	conn.relayServerAddr = rci.relayedConn.RemoteAddr().String()
+	conn.updateRelayStatus(conn.relayServerAddr, rci.rosenpassPubKey, updateTime)
 	conn.Log.Infof("start to communicate with peer via relay")
 	conn.doOnConnected(rci.rosenpassPubKey, rci.rosenpassAddr, updateTime)
+	// The pair is up. From here the UDP relay is tried beside it.
+	conn.workerRelayUDP.Start()
+}
+
+// onRelayUDPReady puts a proved path through the plain-UDP relay into
+// service, if the pair is on the other relay now, and reports whether it took
+// the connection. The other relay's proxy stays, paused: it is what the pair
+// falls back to, with no dial.
+func (conn *Conn) onRelayUDPReady(udpConn net.Conn) bool {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	if conn.ctx.Err() != nil || conn.currentConnPriority != conntype.Relay || conn.wgProxyRelay == nil {
+		return false
+	}
+
+	wgProxy, err := conn.newProxy(udpConn)
+	if err != nil {
+		conn.Log.Errorf("failed to add the UDP relay's conn to a local proxy: %v", err)
+		return false
+	}
+	wgProxy.SetDisconnectListener(conn.onRelayUDPDisconnected)
+	ep := wgProxy.EndpointAddr()
+
+	conn.wgProxyRelay.Pause()
+	wgProxy.Work()
+	if err := conn.endpointUpdater.SwitchWGEndpoint(ep, conn.presharedKey(conn.rosenpassRemoteKey)); err != nil {
+		conn.Log.Errorf("failed to switch to the UDP relay: %v", err)
+		// The proxy does not own the conn it failed to serve: the caller closes it.
+		_ = wgProxy.CloseConn()
+		conn.wgProxyRelay.Work()
+		return false
+	}
+	// What still arrives over the other relay reaches WireGuard as if from here.
+	conn.wgProxyRelay.RedirectAs(ep)
+
+	conn.wgProxyUDP = wgProxy
+	conn.currentConnPriority = conntype.RelayUDP
+	conn.Log.Infof("relay tier: UDP, through %s (was %s)", udpConn.RemoteAddr(), conn.relayServerAddr)
+	conn.updateRelayStatus("udp://"+udpConn.RemoteAddr().String(), conn.rosenpassRemoteKey, time.Now())
+	return true
+}
+
+func (conn *Conn) onRelayUDPDisconnected() {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	conn.handleRelayUDPDisconnectedLocked()
+}
+
+// handleRelayUDPDisconnectedLocked ends the UDP relay path and puts the pair
+// back on the other relay, which was kept. The worker tries the UDP relay
+// again by itself. Caller must hold conn.mu.
+func (conn *Conn) handleRelayUDPDisconnectedLocked() {
+	if conn.ctx.Err() != nil || conn.wgProxyUDP == nil {
+		return
+	}
+	_ = conn.wgProxyUDP.CloseConn()
+	conn.wgProxyUDP = nil
+	if conn.currentConnPriority != conntype.RelayUDP {
+		return
+	}
+
+	if conn.wgProxyRelay != nil {
+		conn.wgProxyRelay.Work()
+		if err := conn.endpointUpdater.SwitchWGEndpoint(conn.wgProxyRelay.EndpointAddr(), conn.presharedKey(conn.rosenpassRemoteKey)); err != nil {
+			conn.Log.Errorf("failed to switch back from the UDP relay: %v", err)
+		}
+		conn.currentConnPriority = conntype.Relay
+		conn.Log.Infof("relay tier: back on %s, the UDP relay's path ended", conn.relayServerAddr)
+		conn.updateRelayStatus(conn.relayServerAddr, conn.rosenpassRemoteKey, time.Now())
+		return
+	}
+
+	// The other relay went while the pair was on this one: nothing is left.
+	conn.Log.Infof("relay tier: none, the UDP relay's path ended and no other relay is connected")
+	conn.currentConnPriority = conntype.None
+	if err := conn.config.WgConfig.WgInterface.RemoveEndpointAddress(conn.config.WgConfig.RemoteKey); err != nil {
+		conn.Log.Errorf("failed to remove wg endpoint: %v", err)
+	}
+	conn.disableWgWatcherIfNeeded()
+	conn.metricsStages.Disconnected()
+}
+
+// dropRelayUDPLocked ends the UDP relay's attempt and its path without
+// touching WireGuard's endpoint: for a path that outranks it, and for Close.
+// Caller must hold conn.mu.
+func (conn *Conn) dropRelayUDPLocked() {
+	conn.workerRelayUDP.Stop()
+	if conn.wgProxyUDP != nil {
+		_ = conn.wgProxyUDP.CloseConn()
+		conn.wgProxyUDP = nil
+	}
 }
 
 func (conn *Conn) onRelayDisconnected() {
@@ -693,6 +811,9 @@ func (conn *Conn) onWGDisconnected(watcherCtx context.Context) {
 	case conntype.Relay:
 		conn.workerRelay.CloseConn()
 		conn.handleRelayDisconnectedLocked()
+	case conntype.RelayUDP:
+		// WireGuard saw nothing over the UDP relay: back to the other one.
+		conn.handleRelayUDPDisconnectedLocked()
 	case conntype.ICEP2P, conntype.ICETurn:
 		conn.workerICE.Close()
 	default:
@@ -794,7 +915,7 @@ func (conn *Conn) doOnConnected(remoteRosenpassPubKey []byte, remoteRosenpassAdd
 
 func (conn *Conn) isRelayed() bool {
 	switch conn.currentConnPriority {
-	case conntype.Relay, conntype.ICETurn:
+	case conntype.Relay, conntype.RelayUDP, conntype.ICETurn:
 		return true
 	default:
 		return false
@@ -803,6 +924,10 @@ func (conn *Conn) isRelayed() bool {
 
 func (conn *Conn) evalStatus() ConnStatus {
 	if conn.statusRelay.Get() == worker.StatusConnected || conn.statusICE.Get() == worker.StatusConnected {
+		return StatusConnected
+	}
+	// On the UDP relay the pair is connected whatever the other relay's state.
+	if conn.currentConnPriority == conntype.RelayUDP {
 		return StatusConnected
 	}
 
@@ -1071,7 +1196,7 @@ func boolToConnStatus(connected bool) guard.ConnStatus {
 
 func metricsConnType(priority conntype.ConnPriority) metrics.ConnectionType {
 	switch priority {
-	case conntype.Relay:
+	case conntype.Relay, conntype.RelayUDP:
 		return metrics.ConnectionTypeRelay
 	case conntype.ICETurn:
 		return metrics.ConnectionTypeICETurn

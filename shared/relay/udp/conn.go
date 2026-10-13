@@ -532,14 +532,17 @@ func (c *Conn) Close() error {
 	return nil
 }
 
+// Done is closed when the connection ended, by Close or as dead.
+func (c *Conn) Done() <-chan struct{} { return c.closed }
+
 // Stats are what the connection carried: WireGuard packets each way, and
 // packets that were not for it (another source, another VNI, not openable).
 type Stats struct {
-	VNI                   uint32
-	Relay                 netip.AddrPort
-	RxPackets, TxPackets  uint64
-	RxNotOurs             uint64
-	SinceLastReceive      time.Duration
+	VNI                  uint32
+	Relay                netip.AddrPort
+	RxPackets, TxPackets uint64
+	RxNotOurs            uint64
+	SinceLastReceive     time.Duration
 }
 
 func (c *Conn) Stats() Stats {

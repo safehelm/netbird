@@ -2963,6 +2963,7 @@ func convertToOfferAnswer(msg *sProto.Message) (*peer.OfferAnswer, error) {
 		WgListenPort:    int(msg.GetBody().GetWgListenPort()),
 		Version:         msg.GetBody().GetNetBirdVersion(),
 		RosenpassPubKey: rosenpassPubKey,
+		RelayUDPKey:     msg.GetBody().GetRelayUdpKey(),
 		RosenpassAddr:   rosenpassAddr,
 		RelaySrvAddress: msg.GetBody().GetRelayServerAddress(),
 		RelaySrvIP:      relayIP,

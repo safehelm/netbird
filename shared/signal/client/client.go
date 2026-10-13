@@ -55,6 +55,9 @@ type CredentialPayload struct {
 	RelaySrvAddress string
 	RelaySrvIP      netip.Addr
 	SessionID       []byte
+	// RelayUDPKey is the sender's relay key for a plain-UDP relay; empty when
+	// it uses none.
+	RelayUDPKey []byte
 }
 
 // UnMarshalCredential parses the credentials from the message and returns a Credential instance
@@ -88,6 +91,9 @@ func MarshalCredential(myKey wgtypes.Key, remoteKey string, p CredentialPayload)
 	}
 	if p.RelaySrvIP.IsValid() {
 		body.RelayServerIP = p.RelaySrvIP.Unmap().AsSlice()
+	}
+	if len(p.RelayUDPKey) > 0 {
+		body.RelayUdpKey = p.RelayUDPKey
 	}
 	return &proto.Message{
 		Key:       myKey.PublicKey().String(),

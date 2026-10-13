@@ -45,6 +45,10 @@ type OfferAnswer struct {
 	// relay server. Used as a dial target if DNS for RelaySrvAddress
 	// fails. Zero value if the peer did not advertise an IP.
 	RelaySrvIP netip.Addr
+	// RelayUDPKey is the remote peer's relay key for a relay that forwards
+	// plain UDP when receiving, and ours when sending. Empty: that peer uses
+	// no such relay.
+	RelayUDPKey []byte
 	// SessionID is the unique identifier of the session, used to discard old messages
 	SessionID *ICESessionID
 }
@@ -61,6 +65,9 @@ type Handshaker struct {
 	ice           *WorkerICE
 	relay         *WorkerRelay
 	metricsStages *MetricsStages
+	// relayUDPKey returns our relay key for a plain-UDP relay, to go in every
+	// offer and answer; nil or an empty answer when this client uses none.
+	relayUDPKey func() []byte
 	// relayListener is not blocking because the listener is using a goroutine to process the messages
 	// and it will only keep the latest message if multiple offers are received in a short time
 	// this is to avoid blocking the handshaker if the listener is doing some heavy processing
@@ -239,6 +246,10 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 	if addr, ip, err := h.relay.RelayInstanceAddress(); err == nil {
 		answer.RelaySrvAddress = addr
 		answer.RelaySrvIP = ip
+	}
+
+	if h.relayUDPKey != nil {
+		answer.RelayUDPKey = h.relayUDPKey()
 	}
 
 	return answer

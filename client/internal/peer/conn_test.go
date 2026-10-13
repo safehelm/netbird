@@ -396,6 +396,7 @@ func TestMetricsConnType(t *testing.T) {
 		expected metrics.ConnectionType
 	}{
 		{"relay", conntype.Relay, metrics.ConnectionTypeRelay},
+		{"the UDP relay is a relay", conntype.RelayUDP, metrics.ConnectionTypeRelay},
 		{"ice over turn is relayed, not p2p", conntype.ICETurn, metrics.ConnectionTypeICETurn},
 		{"direct p2p", conntype.ICEP2P, metrics.ConnectionTypeICEP2P},
 		{"unset priority is unknown, not p2p", conntype.None, metrics.ConnectionTypeUnknown},
@@ -410,7 +411,7 @@ func TestMetricsConnType(t *testing.T) {
 }
 
 func TestMetricsConnType_RelayedMatchesIsRelayed(t *testing.T) {
-	for _, priority := range []conntype.ConnPriority{conntype.None, conntype.Relay, conntype.ICETurn, conntype.ICEP2P} {
+	for _, priority := range []conntype.ConnPriority{conntype.None, conntype.Relay, conntype.RelayUDP, conntype.ICETurn, conntype.ICEP2P} {
 		conn := &Conn{currentConnPriority: priority}
 		tag := metricsConnType(priority)
 		relayedTag := tag == metrics.ConnectionTypeRelay || tag == metrics.ConnectionTypeICETurn

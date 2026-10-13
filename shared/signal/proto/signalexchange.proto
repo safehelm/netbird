@@ -75,6 +75,11 @@ message Body {
   // fallback dial target when DNS resolution of relayServerAddress fails.
   // SNI/TLS verification still uses relayServerAddress.
   optional bytes relayServerIP = 11;
+
+  // relayUdpKey is the sender's relay key, 32 bytes: the Curve25519 public
+  // key it binds with at a relay that forwards plain UDP (shared/relay/udp).
+  // Set by a peer that can use such a relay; absent otherwise.
+  optional bytes relayUdpKey = 12;
 }
 
 // Mode indicates a connection mode

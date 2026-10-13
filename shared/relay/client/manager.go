@@ -346,6 +346,12 @@ func (m *Manager) UpdateToken(token *relayAuth.Token) error {
 	return m.tokenStore.UpdateToken(token)
 }
 
+// AuthToken returns the relay token as it is sent to a relay: what a relay
+// that shares the relays' secret accepts as proof of a client of theirs.
+func (m *Manager) AuthToken() []byte {
+	return m.tokenStore.TokenBinary()
+}
+
 func (m *Manager) openConnVia(ctx context.Context, serverAddress, peerKey string, serverIP netip.Addr) (net.Conn, error) {
 	// check if already has a connection to the desired relay server
 	m.relayClientsMutex.RLock()
