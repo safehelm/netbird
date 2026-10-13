@@ -812,6 +812,9 @@ func (c *Client) writeTo(containerRef *connContainer, dstID messages.PeerID, pay
 // transports. A single fallback is triggered per connection regardless of how
 // many oversized datagrams arrive. cause carries the datagram size and budget.
 func (c *Client) onDatagramTooLarge(conn net.Conn, cause error) {
+	// Every one is counted, the first and the ones the warning below no
+	// longer mentions (omnuv).
+	dropstat.TooLarge.Add(1)
 	// Handle one oversized datagram per connection; a burst triggers a single
 	// fallback (and a single log line), not many.
 	if !c.datagramFallbackTriggered.CompareAndSwap(false, true) {

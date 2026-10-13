@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	netErr "github.com/netbirdio/netbird/shared/relay/client/dialer/net"
+	"github.com/netbirdio/netbird/shared/relay/dropstat"
 )
 
 // closeTrackingConn records whether Close was called; only Close is exercised.
@@ -129,6 +130,22 @@ func TestOnDatagramTooLargeQUICPinned(t *testing.T) {
 
 	assert.False(t, conn.closed, "QUIC pin keeps the connection, no fallback redial")
 	assert.False(t, tf.avoidDatagramSized(url), "QUIC pin records no fallback")
+}
+
+// Held to QUIC, a packet over the connection's budget is dropped and the
+// warning is given once: the count is what says how many went (omnuv).
+func TestOnDatagramTooLargeCountsEveryPacket(t *testing.T) {
+	t.Setenv(EnvRelayTransport, string(TransportModeQUIC))
+	c := &Client{
+		log:               log.WithField("test", t.Name()),
+		connectionURL:     "rels://relay.example:443",
+		transportFallback: newTransportFallback(),
+	}
+	before := dropstat.TooLarge.Load()
+	for range 3 {
+		c.onDatagramTooLarge(&closeTrackingConn{}, netErr.ErrDatagramTooLarge)
+	}
+	assert.Equal(t, before+3, dropstat.TooLarge.Load(), "every oversized packet is counted, not only the first")
 }
 
 func TestTransportFallbackPerServer(t *testing.T) {

@@ -1,7 +1,6 @@
 package dropstat
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/quic-go/quic-go"
@@ -9,19 +8,16 @@ import (
 
 // The log line is read by name, field by field (omnuv's runbook and its
 // bench): every counter is in it once, in the order counts() reads them, and
-// the library's unprocessed-packet drops are the last.
+// a new one goes at the end.
 func TestLineNamesEveryCounterInOrder(t *testing.T) {
-	var c [5]uint64
+	var c [6]uint64
 	for i := range c {
 		c[i] = uint64(i + 1)
 	}
 	got := line(c)
-	want := "onv dropstat channel_drops=1 quic_rcv_discards=2 quic_send_waits=3 write_errors=4 quic_unprocessed_drops=5"
+	want := "onv dropstat channel_drops=1 quic_rcv_discards=2 quic_send_waits=3 write_errors=4 quic_unprocessed_drops=5 too_large=6"
 	if got != want {
 		t.Fatalf("line:\n got %q\nwant %q", got, want)
-	}
-	if !strings.HasSuffix(got, " quic_unprocessed_drops=5") {
-		t.Fatalf("the unprocessed-packet drops are not the last field: %q", got)
 	}
 }
 
