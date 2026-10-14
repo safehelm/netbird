@@ -50,11 +50,13 @@ func real(t *testing.T) *realRelay {
 	return &realRelay{api: api, secret: secret, http: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}}
 }
 
-// relayToken is NetBird's: an algorithm byte, an HMAC-SHA256 of the payload,
-// and the payload, the expiry as decimal unix time.
+// relayToken is NetBird's: an algorithm byte, an HMAC-SHA256 of the payload
+// keyed by the secret's SHA-256, and the payload, the expiry as decimal unix
+// time.
 func relayToken(secret string, expiry time.Time) []byte {
 	payload := strconv.FormatInt(expiry.Unix(), 10)
-	mac := hmac.New(sha256.New, []byte(secret))
+	key := sha256.Sum256([]byte(secret))
+	mac := hmac.New(sha256.New, key[:])
 	mac.Write([]byte(payload))
 	return append(append([]byte{1}, mac.Sum(nil)...), payload...)
 }
@@ -435,4 +437,71 @@ func TestRealAPacketFromAnotherSourceIsNotTakenAsThePeers(t *testing.T) {
 	if a.Stats().RxNotOurs == 0 {
 		t.Fatal("the forged packet was not counted as not ours: it never reached the socket, and this test proved nothing")
 	}
+}
+
+// ReadBatch carries what Read does, in order and unchanged, and takes more
+// than one packet a call when the kernel holds them.
+func TestRealABatchReadCarriesWhatReadDoesAndTakesSeveralAtOnce(t *testing.T) {
+	r := real(t)
+	a, b := r.pair(t)
+	if b.batch == nil {
+		t.Fatal("the socket was not taken for batched reads: this test would prove nothing")
+	}
+	const count = 300
+	type result struct {
+		got, calls, most int
+		err              error
+	}
+	done := make(chan result, 1)
+	// The reader runs while the writer sends, as the proxy does: read after
+	// the fact, the socket's own buffer would hold only a part of them.
+	go func() {
+		bufs, sizes := make([][]byte, 64), make([]int, 64)
+		for i := range bufs {
+			bufs[i] = make([]byte, 2048)
+		}
+		var res result
+		for res.got < count {
+			_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+			n, err := b.ReadBatch(bufs, sizes)
+			if err != nil {
+				res.err = fmt.Errorf("after %d of %d in %d calls: %w; b's counters %+v", res.got, count, res.calls, err, b.Stats())
+				break
+			}
+			res.calls++
+			res.most = max(res.most, n)
+			for k := 0; k < n; k++ {
+				want := bytes.Repeat([]byte{byte(res.got)}, 100+res.got%900)
+				copy(want, fmt.Sprintf("batch %04d", res.got))
+				if !bytes.Equal(bufs[k][:sizes[k]], want) {
+					res.err = fmt.Errorf("packet %d arrived changed or out of order", res.got)
+					break
+				}
+				res.got++
+			}
+			if res.err != nil {
+				break
+			}
+		}
+		done <- res
+	}()
+	for i := 0; i < count; i++ {
+		pkt := bytes.Repeat([]byte{byte(i)}, 100+i%900)
+		copy(pkt, fmt.Sprintf("batch %04d", i))
+		if _, err := a.Write(pkt); err != nil {
+			t.Fatal(err)
+		}
+		if i%10 == 9 {
+			time.Sleep(2 * time.Millisecond) // groups of ten: several queued for one read, none of a burst dropped
+		}
+	}
+	res := <-done
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	calls, most := res.calls, res.most
+	if most < 2 {
+		t.Fatalf("%d calls for %d packets, never more than one a call: no batch was read", calls, count)
+	}
+	t.Logf("%d packets in %d calls, at most %d in one", count, calls, most)
 }

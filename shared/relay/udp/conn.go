@@ -16,7 +16,10 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // Timers are the waits of one attempt and of a connection in service. None
@@ -195,6 +198,10 @@ type Conn struct {
 
 	rbuf  []byte
 	wpool sync.Pool
+	// batch reads several datagrams a system call (recvmmsg), for ReadBatch;
+	// nil when the socket is not one it can read.
+	batch *ipv4.PacketConn
+	msgs  []ipv4.Message
 
 	// Counters, read by Stats.
 	rxPackets, txPackets, rxOther atomic.Uint64
@@ -242,6 +249,13 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		rbuf:         make([]byte, 65535),
 	}
 	c.fast, _ = pc.(addrPortConn)
+	if _, ok := pc.(syscall.Conn); ok {
+		c.batch = ipv4.NewPacketConn(pc)
+		c.msgs = make([]ipv4.Message, readBatchSize)
+		for i := range c.msgs {
+			c.msgs[i].Buffers = [][]byte{make([]byte, readBatchBuffer)}
+		}
+	}
 	c.wpool.New = func() any { b := make([]byte, 0, 2048); return &b }
 	if err := c.establish(ctx, ep.addrs); err != nil {
 		_ = pc.Close()
@@ -449,49 +463,112 @@ func (c *Conn) fail(err error) {
 	})
 }
 
+const (
+	// readBatchSize is how many datagrams ReadBatch asks the kernel for at
+	// once; readBatchBuffer, the room for one: a WireGuard packet of the
+	// largest wt0 and the relay's header fit with room to spare.
+	readBatchSize   = 64
+	readBatchBuffer = 2048
+)
+
+// accept takes one datagram from the socket: the WireGuard packet it carries,
+// or nothing when it was a ping (answered) or not this connection's (counted).
+func (c *Conn) accept(pkt []byte, from netip.AddrPort) ([]byte, bool) {
+	if from != c.relay {
+		c.rxOther.Add(1)
+		return nil, false
+	}
+	vni, proto, control, err := parseGeneve(pkt)
+	if err != nil || vni != c.vni || control {
+		c.rxOther.Add(1)
+		return nil, false
+	}
+	switch proto {
+	case protoWireGuard:
+		c.lastRx.Store(time.Now().UnixNano())
+		c.rxPackets.Add(1)
+		return pkt[GeneveLen:], true
+	case protoDisco:
+		clear, ok := open(pkt[GeneveLen:], c.peer, c.peerShared)
+		if !ok {
+			c.rxOther.Add(1)
+			return nil, false
+		}
+		c.lastRx.Store(time.Now().UnixNano())
+		if typ, id, err := parsePing(clear); err == nil && typ == typePing {
+			_ = c.sendPing(typePong, id, c.relay)
+		}
+		return nil, false
+	default:
+		c.rxOther.Add(1)
+		return nil, false
+	}
+}
+
+func (c *Conn) readErr(err error) error {
+	select {
+	case <-c.closed:
+		if c.closeErr != nil {
+			return c.closeErr
+		}
+		return net.ErrClosed
+	default:
+	}
+	return err
+}
+
 // Read returns the next WireGuard packet from the peer. Pings and pongs are
 // answered and counted on the way.
 func (c *Conn) Read(b []byte) (int, error) {
 	for {
 		n, from, err := c.readFrom(c.rbuf)
 		if err != nil {
-			select {
-			case <-c.closed:
-				if c.closeErr != nil {
-					return 0, c.closeErr
-				}
-				return 0, net.ErrClosed
-			default:
-			}
+			return 0, c.readErr(err)
+		}
+		if payload, ok := c.accept(c.rbuf[:n], from); ok {
+			return copy(b, payload), nil
+		}
+	}
+}
+
+// ReadBatch is the relay client's BatchReader: up to len(bufs) WireGuard
+// packets from one system call, which the proxy injects into WireGuard with
+// one more. It blocks for the first datagram and takes what the kernel has
+// queued beside it; a batch that held only pings is read again.
+func (c *Conn) ReadBatch(bufs [][]byte, sizes []int) (int, error) {
+	if len(bufs) == 0 {
+		return 0, nil
+	}
+	if c.batch == nil {
+		n, err := c.Read(bufs[0])
+		if err != nil {
 			return 0, err
 		}
-		if from != c.relay {
-			c.rxOther.Add(1)
-			continue
+		sizes[0] = n
+		return 1, nil
+	}
+	for {
+		got, err := c.batch.ReadBatch(c.msgs[:min(len(bufs), len(c.msgs))], 0)
+		if err != nil {
+			return 0, c.readErr(err)
 		}
-		pkt := c.rbuf[:n]
-		vni, proto, control, err := parseGeneve(pkt)
-		if err != nil || vni != c.vni || control {
-			c.rxOther.Add(1)
-			continue
-		}
-		switch proto {
-		case protoWireGuard:
-			c.lastRx.Store(time.Now().UnixNano())
-			c.rxPackets.Add(1)
-			return copy(b, pkt[GeneveLen:]), nil
-		case protoDisco:
-			clear, ok := open(pkt[GeneveLen:], c.peer, c.peerShared)
-			if !ok {
+		n := 0
+		for i := 0; i < got; i++ {
+			m := &c.msgs[i]
+			ua, _ := m.Addr.(*net.UDPAddr)
+			if ua == nil {
 				c.rxOther.Add(1)
 				continue
 			}
-			c.lastRx.Store(time.Now().UnixNano())
-			if typ, id, err := parsePing(clear); err == nil && typ == typePing {
-				_ = c.sendPing(typePong, id, c.relay)
+			ap := ua.AddrPort()
+			payload, ok := c.accept(m.Buffers[0][:m.N], netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()))
+			if ok {
+				sizes[n] = copy(bufs[n], payload)
+				n++
 			}
-		default:
-			c.rxOther.Add(1)
+		}
+		if n > 0 {
+			return n, nil
 		}
 	}
 }

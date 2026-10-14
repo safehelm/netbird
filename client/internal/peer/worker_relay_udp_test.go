@@ -375,7 +375,8 @@ func realRelayWorker(t *testing.T, conn *Conn, ctrl bool, key *relayUDP.Key) *Wo
 		relayAddress: func() (string, error) { return "rels://127.0.0.1:443", nil },
 		token: func() []byte {
 			payload := strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)
-			mac := hmac.New(sha256.New, []byte(secret))
+			key := sha256.Sum256([]byte(secret))
+			mac := hmac.New(sha256.New, key[:])
 			mac.Write([]byte(payload))
 			return append(append([]byte{1}, mac.Sum(nil)...), payload...)
 		},
