@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -202,9 +203,16 @@ type Conn struct {
 	// nil when the socket is not one it can read.
 	batch *ipv4.PacketConn
 	msgs  []ipv4.Message
+	// gro is set when the kernel coalesces datagrams for this socket;
+	// pending holds the packets of the last batch not handed out yet. They
+	// point into msgs, which is read again only when pending is empty.
+	gro     bool
+	pending [][]byte
 
 	// Counters, read by Stats.
 	rxPackets, txPackets, rxOther atomic.Uint64
+	// rxCoalesced counts buffers that held more than one datagram.
+	rxCoalesced atomic.Uint64
 }
 
 // Dial allocates the pair's endpoint, binds this side to it, and returns once
@@ -260,6 +268,17 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 	if err := c.establish(ctx, ep.addrs); err != nil {
 		_ = pc.Close()
 		return nil, err
+	}
+	// After the handshake, which reads one datagram at a time: from here a
+	// buffer may hold many, and only the batched read splits them.
+	// NB_RELAY_UDP_GRO=false keeps one a datagram, for a comparison.
+	if c.batch != nil && os.Getenv("NB_RELAY_UDP_GRO") != "false" && enableGRO(pc) {
+		c.gro = true
+		c.msgs = make([]ipv4.Message, readBatchSizeGRO)
+		for i := range c.msgs {
+			c.msgs[i].Buffers = [][]byte{make([]byte, 65535)}
+			c.msgs[i].OOB = make([]byte, groOOB)
+		}
 	}
 	c.lastRx.Store(time.Now().UnixNano())
 	go c.keepalive()
@@ -469,6 +488,9 @@ const (
 	// largest wt0 and the relay's header fit with room to spare.
 	readBatchSize   = 64
 	readBatchBuffer = 2048
+	// readBatchSizeGRO is how many buffers are read at once when each may
+	// hold up to 64 datagrams.
+	readBatchSizeGRO = 16
 )
 
 // accept takes one datagram from the socket: the WireGuard packet it carries,
@@ -520,6 +542,14 @@ func (c *Conn) readErr(err error) error {
 // Read returns the next WireGuard packet from the peer. Pings and pongs are
 // answered and counted on the way.
 func (c *Conn) Read(b []byte) (int, error) {
+	if c.batch != nil {
+		// One path for both reads, so a coalesced buffer is always split.
+		var size [1]int
+		if _, err := c.ReadBatch([][]byte{b}, size[:]); err != nil {
+			return 0, err
+		}
+		return size[0], nil
+	}
 	for {
 		n, from, err := c.readFrom(c.rbuf)
 		if err != nil {
@@ -548,11 +578,24 @@ func (c *Conn) ReadBatch(bufs [][]byte, sizes []int) (int, error) {
 		return 1, nil
 	}
 	for {
-		got, err := c.batch.ReadBatch(c.msgs[:min(len(bufs), len(c.msgs))], 0)
+		n := 0
+		for n < len(bufs) && len(c.pending) > 0 {
+			sizes[n] = copy(bufs[n], c.pending[0])
+			c.pending = c.pending[1:]
+			n++
+		}
+		if n > 0 {
+			return n, nil
+		}
+		want := len(c.msgs)
+		if !c.gro {
+			want = min(len(bufs), want)
+		}
+		got, err := c.batch.ReadBatch(c.msgs[:want], 0)
 		if err != nil {
 			return 0, c.readErr(err)
 		}
-		n := 0
+		c.pending = c.pending[:0]
 		for i := 0; i < got; i++ {
 			m := &c.msgs[i]
 			ua, _ := m.Addr.(*net.UDPAddr)
@@ -561,14 +604,24 @@ func (c *Conn) ReadBatch(bufs [][]byte, sizes []int) (int, error) {
 				continue
 			}
 			ap := ua.AddrPort()
-			payload, ok := c.accept(m.Buffers[0][:m.N], netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()))
-			if ok {
-				sizes[n] = copy(bufs[n], payload)
-				n++
+			from := netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+			data := m.Buffers[0][:m.N]
+			seg := 0
+			if c.gro && m.NN > 0 {
+				seg = groSize(m.OOB[:m.NN])
 			}
-		}
-		if n > 0 {
-			return n, nil
+			if seg <= 0 || seg >= len(data) {
+				if payload, ok := c.accept(data, from); ok {
+					c.pending = append(c.pending, payload)
+				}
+				continue
+			}
+			c.rxCoalesced.Add(1)
+			for off := 0; off < len(data); off += seg {
+				if payload, ok := c.accept(data[off:min(off+seg, len(data))], from); ok {
+					c.pending = append(c.pending, payload)
+				}
+			}
 		}
 	}
 }
@@ -619,6 +672,8 @@ type Stats struct {
 	Relay                netip.AddrPort
 	RxPackets, TxPackets uint64
 	RxNotOurs            uint64
+	RxCoalesced          uint64
+	GRO                  bool
 	SinceLastReceive     time.Duration
 }
 
@@ -626,6 +681,7 @@ func (c *Conn) Stats() Stats {
 	return Stats{
 		VNI: c.vni, Relay: c.relay,
 		RxPackets: c.rxPackets.Load(), TxPackets: c.txPackets.Load(), RxNotOurs: c.rxOther.Load(),
+		RxCoalesced: c.rxCoalesced.Load(), GRO: c.gro,
 		SinceLastReceive: time.Since(time.Unix(0, c.lastRx.Load())),
 	}
 }
