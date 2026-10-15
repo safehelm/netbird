@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -294,4 +295,66 @@ func TestQuinnCloseDuringConcurrentWrites(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("native close did not unblock writers")
 	}
+}
+
+// Every connection of a listener shares its socket, so each must be served
+// with its own state: a decrypting receive thread with one connection's keys
+// lost most of the others' packets, and one waker lost the others' turns.
+func TestQuinnConcurrentConnectionsEcho(t *testing.T) {
+	l, cfg := nativeQuinnListener(t)
+	const clients, rounds = 4, 300
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conns := make([]*goquic.Conn, clients)
+	for i := range conns {
+		conns[i] = verifiedGoClient(t, l, cfg)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < clients; i++ {
+		server, err := l.listener.Accept(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = server.Close() })
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b := make([]byte, 2000)
+			for j := 0; j < rounds; j++ {
+				n, err := server.Read(ctx, b)
+				if err != nil {
+					return
+				}
+				if _, err := server.Write(ctx, b[:n]); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	errs := make(chan error, clients)
+	for i, c := range conns {
+		go func() {
+			for j := 0; j < rounds; j++ {
+				payload := []byte(fmt.Sprintf("client %d round %d %s", i, j, bytes.Repeat([]byte{'x'}, 900)))
+				if err := c.SendDatagram(payload); err != nil {
+					errs <- fmt.Errorf("client %d round %d send: %w", i, j, err)
+					return
+				}
+				rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
+				got, err := c.ReceiveDatagram(rctx)
+				rcancel()
+				if err != nil {
+					errs <- fmt.Errorf("client %d round %d: no echo: %w", i, j, err)
+					return
+				}
+				if !bytes.Equal(got, payload) {
+					errs <- fmt.Errorf("client %d round %d: echo differs", i, j)
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for range conns {
+		require.NoError(t, <-errs)
+	}
+	wg.Wait()
 }
