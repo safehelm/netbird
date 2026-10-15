@@ -1,0 +1,23 @@
+[package]
+name = "onv-quinn-relay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Quinn 0.11.12 with Omnuv's send, seal, receive and decrypt threads
+# (branch onv/0.11.12-relay), checked out beside this tree as ../quinn.
+quinn = { path = "../../../../../../quinn/quinn", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+serde_json = "1"
+
+[profile.release]
+debug = 1
+
+[workspace]
