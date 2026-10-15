@@ -358,3 +358,27 @@ func TestQuinnConcurrentConnectionsEcho(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// A WireGuard packet at NetBird's 1,280-byte MTU is 1,312 bytes, over the
+// 1,195 a connection starts with: the listener must send one once path MTU
+// discovery has raised the limit, which it read once at accept before.
+func TestQuinnDatagramLimitFollowsPathMTU(t *testing.T) {
+	l, cfg := nativeQuinnListener(t)
+	client := verifiedGoClient(t, l, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	server, err := l.listener.Accept(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Close() })
+	payload := bytes.Repeat([]byte{0x5a}, 1312)
+	var werr error
+	for start := time.Now(); time.Since(start) < 5*time.Second; time.Sleep(50 * time.Millisecond) {
+		if _, werr = server.Write(ctx, payload); werr == nil {
+			break
+		}
+	}
+	require.NoError(t, werr, "a 1,312-byte DATAGRAM must be sent once the path allows it")
+	got, err := client.ReceiveDatagram(ctx)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}

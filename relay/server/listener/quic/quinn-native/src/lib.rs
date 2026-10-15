@@ -103,7 +103,6 @@ struct PumpStats {
 }
 struct Session {
     closed: AtomicBool,
-    max_datagram: Option<usize>,
     tx: mpsc::Sender<Bytes>,
     tx_stop: watch::Sender<bool>,
     tx_task: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
@@ -388,7 +387,6 @@ pub extern "C" fn onv_quinn_accept(id: u64, millis: u64) -> i64 {
                         return -1;
                     }
                     let peer = c.remote_address();
-                    let max_datagram = c.max_datagram_size();
                     let (tx, rx) = mpsc::channel(8);
                     let (tx_stop, stopped) = watch::channel(false);
                     let pump = Arc::new(PumpStats::default());
@@ -403,7 +401,6 @@ pub extern "C" fn onv_quinn_accept(id: u64, millis: u64) -> i64 {
                         id,
                         Arc::new(Session {
                             closed: AtomicBool::new(false),
-                            max_datagram,
                             tx,
                             tx_stop,
                             tx_task: AsyncMutex::new(tx_task),
@@ -493,7 +490,11 @@ pub unsafe extern "C" fn onv_quinn_write(id: u64, p: *const u8, n: usize, millis
             if s.closed.load(Ordering::Acquire) {
                 return -1;
             }
-            let Some(max) = s.max_datagram else { return -4 };
+            // Asked each time: path MTU discovery raises it after the
+            // handshake, above the 1,195 bytes a connection starts with
+            let Some(max) = s.conn.max_datagram_size() else {
+                return -4;
+            };
             if n > max {
                 return -3;
             }
