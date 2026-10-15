@@ -194,6 +194,7 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.11.12"
+source = "git+https://github.com/safehelm/quinn?rev=e017d546d242ac9fdcbec503aede88ba88fb449e#e017d546d242ac9fdcbec503aede88ba88fb449e"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -212,6 +213,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.18"
+source = "git+https://github.com/safehelm/quinn?rev=e017d546d242ac9fdcbec503aede88ba88fb449e#e017d546d242ac9fdcbec503aede88ba88fb449e"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -232,13 +234,14 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.5.15"
+source = "git+https://github.com/safehelm/quinn?rev=e017d546d242ac9fdcbec503aede88ba88fb449e#e017d546d242ac9fdcbec503aede88ba88fb449e"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
