@@ -319,13 +319,25 @@ fn listen(data: &[u8]) -> Result<Arc<Server>, String> {
     if !b.is_empty() || alpn.is_empty() {
         return Err("invalid TLS configuration".into());
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    // ChaCha20-Poly1305 first, chosen over the client's order (16 October 2026):
+    // on a relay host whose CPU has no AES instructions it costs a quarter of
+    // AES-GCM. AES stays offered, and QUIC's Initial packets use it whatever
+    // is chosen. NB_RELAY_QUINN_CIPHER=aes keeps ring's own order.
+    let mut provider = rustls::crypto::ring::default_provider();
+    let chacha_first = std::env::var("NB_RELAY_QUINN_CIPHER").map_or(true, |v| v != "aes");
+    if chacha_first {
+        provider.cipher_suites.sort_by_key(|s| {
+            s.suite() != rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        });
+    }
+    let provider = Arc::new(provider);
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| e.to_string())?
         .with_no_client_auth()
         .with_cert_resolver(certificate.clone());
     tls.alpn_protocols = alpn;
+    tls.ignore_client_order = chacha_first;
     tls.send_tls13_tickets = 0;
     tls.max_early_data_size = 0;
     let crypto = QuicServerConfig::try_from(tls).map_err(|e| e.to_string())?;

@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # Quinn 0.11.12 with Omnuv's send, seal, receive and decrypt threads
 # (safehelm/quinn, branch onv/0.11.12-relay), pinned by commit.
-quinn = { git = "https://github.com/safehelm/quinn", rev = "e017d546d242ac9fdcbec503aede88ba88fb449e", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn = { git = "https://github.com/safehelm/quinn", rev = "0a4d27665f1d2fded340c549a497818db78e62f1", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }

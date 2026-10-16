@@ -456,3 +456,19 @@ func TestQuinnFetchedCertificateIsRenewed(t *testing.T) {
 		require.Equal(t, "relay.example", name)
 	}
 }
+
+// The relay chooses ChaCha20-Poly1305 over the client's own order, and
+// AES-GCM again when told to (NB_RELAY_QUINN_CIPHER=aes).
+func TestQuinnPrefersChaCha20(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want uint16
+	}{{"", tls.TLS_CHACHA20_POLY1305_SHA256}, {"aes", tls.TLS_AES_128_GCM_SHA256}} {
+		t.Run("cipher="+tc.env, func(t *testing.T) {
+			t.Setenv("NB_RELAY_QUINN_CIPHER", tc.env)
+			l, cfg := nativeQuinnListener(t)
+			client := verifiedGoClient(t, l, cfg)
+			require.Equal(t, tls.CipherSuiteName(tc.want), tls.CipherSuiteName(client.ConnectionState().TLS.CipherSuite))
+		})
+	}
+}
