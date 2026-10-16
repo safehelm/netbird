@@ -29,10 +29,13 @@ const (
 	serverResponseTimeout = 8 * time.Second
 	// defaultConnChannelSize is the buffered-message capacity per peer
 	// connection. It must cover the bandwidth-delay product of a fast relayed
-	// path so steady-state traffic never blocks the shared read loop: at 300
-	// Mbit/s and 50 ms RTT the in-flight data is ~1.9 MB ≈ 213 messages.
-	// Buffers come from the client's pool, so idle connections hold none.
-	defaultConnChannelSize = 512
+	// path so steady-state traffic never blocks the shared read loop, and on
+	// a datagram transport the stalls of the WireGuard side: 4096 is about 95
+	// ms at 450 Mbit/s. 512 (12 ms) dropped 1,026 messages in 10 s of one
+	// relayed stream, which TCP retransmitted one for one; 4096 dropped none
+	// (16 October 2026). Buffers come from the client's pool, so an idle
+	// connection holds none; a full queue holds 4096 of them (bufferSize).
+	defaultConnChannelSize = 4096
 	// EnvConnQueue sets it (64 to 65536 messages).
 	EnvConnQueue = "NB_RELAY_CONN_QUEUE"
 
@@ -52,9 +55,7 @@ const (
 
 // connChannelSize is EnvConnQueue's value, else defaultConnChannelSize. On
 // a datagram transport a message that finds the queue full is dropped at
-// once: the queue is how long the WireGuard side may stall before it loses
-// one (512 is 12 ms at 450 Mbit/s, which a relayed TCP stream read as loss,
-// 16 October 2026).
+// once: the queue is how long the WireGuard side may stall before it loses one.
 var connChannelSize = func() int {
 	v := os.Getenv(EnvConnQueue)
 	if v == "" {
