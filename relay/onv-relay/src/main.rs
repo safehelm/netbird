@@ -100,7 +100,11 @@ fn level(name: &str) -> tracing::level_filters::LevelFilter {
 }
 
 fn init_log(c: &Config) -> Result<(), String> {
-    let builder = tracing_subscriber::fmt().with_max_level(level(&c.log_level)).with_target(false);
+    // Colours only on a terminal: a container's log is a file
+    let builder = tracing_subscriber::fmt()
+        .with_max_level(level(&c.log_level))
+        .with_target(false)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()));
     if c.log_file == "console" {
         builder.init();
     } else {

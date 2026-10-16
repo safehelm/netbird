@@ -310,6 +310,12 @@ async fn health_and_metrics_endpoints() {
     let (status, body) = get(f.running.metrics.unwrap(), "/metrics").await;
     assert_eq!(status, 200);
     assert!(body.contains("# TYPE relay_peers gauge"), "{body}");
+    // A QUIC peer's connection, by its id
+    let _a = logged_in(&f, "metrics-a", true).await;
+    let (_, body) = get(f.running.metrics.unwrap(), "/metrics").await;
+    let id = messages::peer_id_string(&messages::hash_id("metrics-a"));
+    assert!(body.contains(&format!("relay_quic_datagrams_read{{peer=\"{id}\"}} 1\n")), "{body}");
+    assert!(body.contains(&format!("relay_quic_datagrams_received{{peer=\"{id}\"}} 1\n")), "{body}");
     f.running.shutdown().await;
 }
 

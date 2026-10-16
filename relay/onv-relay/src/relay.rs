@@ -65,6 +65,8 @@ pub struct Peer {
     quic: Option<quinn::Connection>,
     listener: Arc<Listener>,
     acked: AtomicBool,
+    /// Messages read from this peer
+    read: AtomicU64,
 }
 
 impl Peer {
@@ -106,6 +108,41 @@ impl Relay {
 
     pub fn peer_count(&self) -> usize {
         self.peers.read().unwrap().len()
+    }
+
+    /// The counters, and each QUIC peer's connection as Quinn counts it. A
+    /// DATAGRAM Quinn received but the relay never read was dropped from a
+    /// full receive queue: `received` less `read`, which nothing else counts
+    pub fn render_metrics(&self) -> String {
+        use std::fmt::Write;
+        let mut s = self.metrics.render();
+        let peers: Vec<_> = self.peers.read().unwrap().values().filter(|p| p.quic.is_some()).cloned().collect();
+        let rows: Vec<(String, quinn::ConnectionStats, u64)> = peers
+            .iter()
+            .map(|p| (p.name.clone(), p.quic.as_ref().unwrap().stats(), p.read.load(Ordering::Relaxed)))
+            .collect();
+        type Series = (&'static str, &'static str, fn(&quinn::ConnectionStats, u64) -> f64);
+        let series: [Series; 8] = [
+            ("relay_quic_datagrams_received", "DATAGRAM frames Quinn received from the peer", |st, _| {
+                st.frame_rx.datagram as f64
+            }),
+            ("relay_quic_datagrams_read", "Messages the relay read from the peer", |_, r| r as f64),
+            ("relay_quic_datagrams_sent", "DATAGRAM frames sent to the peer", |st, _| st.frame_tx.datagram as f64),
+            ("relay_quic_packets_sent", "QUIC packets sent to the peer", |st, _| st.path.sent_packets as f64),
+            ("relay_quic_packets_lost", "QUIC packets to the peer declared lost", |st, _| st.path.lost_packets as f64),
+            ("relay_quic_congestion_events", "Congestion events on the path to the peer", |st, _| {
+                st.path.congestion_events as f64
+            }),
+            ("relay_quic_cwnd_bytes", "Congestion window to the peer", |st, _| st.path.cwnd as f64),
+            ("relay_quic_rtt_seconds", "Round trip to the peer", |st, _| st.path.rtt.as_secs_f64()),
+        ];
+        for (name, help, get) in series {
+            let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge");
+            for (peer, st, read) in &rows {
+                let _ = writeln!(s, "{name}{{peer=\"{peer}\"}} {}", get(st, *read));
+            }
+        }
+        s
     }
 
     /// Runs one connection from its first message to its close
@@ -166,6 +203,8 @@ impl Relay {
             quic: a.quic.clone(),
             listener: listener.clone(),
             acked: AtomicBool::new(false),
+            // its auth message, which Quinn counted as received too
+            read: AtomicU64::new(1),
         });
         info!(peer_id = %peer.name, "peer connected from: {}", a.remote);
         self.listeners.write().unwrap().insert(peer.uid, listener);
@@ -222,7 +261,10 @@ impl Relay {
                 m = reader.read() => m,
             };
             let msg = match msg {
-                Ok(m) => m,
+                Ok(m) => {
+                    peer.read.fetch_add(1, Ordering::Relaxed);
+                    m
+                }
                 Err(ReadEnd::Closed) => return,
                 Err(ReadEnd::Error(e)) => {
                     error!(peer_id = %peer.name, "failed to read message: {e}");

@@ -113,7 +113,7 @@ pub async fn start(o: Options) -> Result<Running, String> {
             let relay = relay.clone();
             async move {
                 if path == "/metrics" {
-                    Reply { status: 200, content_type: "text/plain; version=0.0.4", body: relay.metrics.render() }
+                    Reply { status: 200, content_type: "text/plain; version=0.0.4", body: relay.render_metrics() }
                 } else {
                     http::not_found()
                 }
