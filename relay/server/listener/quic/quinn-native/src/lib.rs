@@ -131,6 +131,23 @@ static BATCH_READ: LazyLock<bool> = LazyLock::new(|| {
         .map(|v| v.parse::<bool>().expect("invalid NB_RELAY_QUINN_BATCH_READ"))
         .unwrap_or(true)
 });
+/// Bytes of datagrams a connection holds received and not yet read, and
+/// queued and not yet sent; NB_RELAY_QUINN_DATAGRAM_RECV_BYTES and _SEND_BYTES
+/// set them. At a relay's round trip (12 ms to the providers' site) the
+/// sender's leg runs ahead of the receiver's while its window grows, and what
+/// a full receive queue cannot hold Quinn drops: 115 kB lost 0.2% of a 150
+/// Mbit/s stream, which the TCP inside reads as congestion.
+fn datagram_bytes(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 64 * 1024)
+        .unwrap_or(default)
+}
+static DATAGRAM_RECV_BYTES: LazyLock<usize> =
+    LazyLock::new(|| datagram_bytes("NB_RELAY_QUINN_DATAGRAM_RECV_BYTES", 4 << 20));
+static DATAGRAM_SEND_BYTES: LazyLock<usize> =
+    LazyLock::new(|| datagram_bytes("NB_RELAY_QUINN_DATAGRAM_SEND_BYTES", 1 << 20));
 static CALL_TIMING: LazyLock<bool> =
     LazyLock::new(|| std::env::var("NB_RELAY_QUINN_TIMING").is_ok_and(|v| v == "1"));
 #[derive(Default)]
@@ -319,8 +336,8 @@ fn listen(data: &[u8]) -> Result<Arc<Server>, String> {
             .map_err(|e| format!("{e}"))?,
     ));
     transport
-        .datagram_receive_buffer_size(Some(if *BATCH_READ { 96 * 1200 } else { 128 * 1200 }))
-        .datagram_send_buffer_size(if *ASYNC_SEND { 16 * 1200 } else { 32 * 1200 });
+        .datagram_receive_buffer_size(Some(*DATAGRAM_RECV_BYTES))
+        .datagram_send_buffer_size(*DATAGRAM_SEND_BYTES);
     transport.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(transport));
