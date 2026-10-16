@@ -14,8 +14,8 @@ import (
 	"github.com/hashicorp/go-multierror"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/ipv4"
-	"golang.org/x/sys/unix"
 	"golang.org/x/net/ipv6"
+	"golang.org/x/sys/unix"
 
 	nberrors "github.com/netbirdio/netbird/client/errors"
 	"github.com/netbirdio/netbird/client/iface/bufsize"
