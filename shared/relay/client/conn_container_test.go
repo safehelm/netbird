@@ -44,7 +44,7 @@ func fillChannel(cc *connContainer, c *Client) {
 
 func TestWriteMsgFastPathNoDrop(t *testing.T) {
 	cc, c := newTestContainer(t, true)
-	defer cc.close()
+	defer cc.close(nil)
 
 	const total = connChannelSize * 5
 	received := make(chan struct{})
@@ -74,7 +74,7 @@ func TestWriteMsgFastPathNoDrop(t *testing.T) {
 
 func TestWriteMsgBlocksThenDropsReliable(t *testing.T) {
 	cc, c := newTestContainer(t, true)
-	defer cc.close()
+	defer cc.close(nil)
 
 	fillChannel(cc, c)
 
@@ -102,7 +102,7 @@ func TestWriteMsgBlocksThenDropsReliable(t *testing.T) {
 
 func TestWriteMsgBlockedSenderReleasedByDrain(t *testing.T) {
 	cc, c := newTestContainer(t, true)
-	defer cc.close()
+	defer cc.close(nil)
 
 	fillChannel(cc, c)
 
@@ -130,7 +130,7 @@ func TestWriteMsgBlockedSenderReleasedByDrain(t *testing.T) {
 
 func TestWriteMsgImmediateDropDatagram(t *testing.T) {
 	cc, c := newTestContainer(t, false)
-	defer cc.close()
+	defer cc.close(nil)
 
 	fillChannel(cc, c)
 
@@ -149,7 +149,7 @@ func TestWriteMsgImmediateDropDatagram(t *testing.T) {
 // double-free — run with -race), and reports no drops.
 func TestReadBatchDrainsInOrder(t *testing.T) {
 	cc, c := newTestContainer(t, true)
-	defer cc.close()
+	defer cc.close(nil)
 
 	const total = 10
 	for i := 0; i < total; i++ {
@@ -194,7 +194,7 @@ func TestReadBatchDrainsInOrder(t *testing.T) {
 // to fill.
 func TestReadBatchDrainsOnlyAvailable(t *testing.T) {
 	cc, c := newTestContainer(t, true)
-	defer cc.close()
+	defer cc.close(nil)
 
 	const queued = 3
 	for i := 0; i < queued; i++ {
@@ -234,7 +234,7 @@ func TestCloseUnblocksPendingWriters(t *testing.T) {
 
 		closed := make(chan struct{})
 		go func() {
-			cc.close()
+			cc.close(nil)
 			close(closed)
 		}()
 
