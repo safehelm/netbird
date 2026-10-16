@@ -3,7 +3,11 @@ use bytes::Bytes;
 use quinn::{
     Connection, Endpoint, ServerConfig, TransportConfig, VarInt, crypto::rustls::QuicServerConfig,
 };
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
+};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     collections::{HashMap, VecDeque},
@@ -12,7 +16,7 @@ use std::{
     pin::pin,
     slice,
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::Poll,
@@ -76,7 +80,41 @@ struct Handshakes {
     rejected: AtomicU64,
     last_error: Mutex<String>,
 }
+/// The certificate a listener presents. It starts empty when the caller has none
+/// yet, and is replaced while the listener runs (a renewal).
+#[derive(Debug, Default)]
+struct Certificate(RwLock<Option<Arc<CertifiedKey>>>);
+impl ResolvesServerCert for Certificate {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.0.read().unwrap().clone()
+    }
+}
+/// A chain and its PKCS #8 key, or nothing when both are empty.
+fn certified(b: &mut &[u8]) -> Result<Option<Arc<CertifiedKey>>, String> {
+    let mut certs = Vec::new();
+    loop {
+        let cert = blob(b)?;
+        if cert.is_empty() {
+            break;
+        };
+        certs.push(CertificateDer::from(cert.to_vec()));
+    }
+    let key = blob(b)?;
+    if certs.is_empty() {
+        return if key.is_empty() {
+            Ok(None)
+        } else {
+            Err("a key with no certificate".into())
+        };
+    }
+    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key.to_vec()));
+    let signer = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|e| e.to_string())?;
+    let certified = CertifiedKey::new(certs, signer);
+    certified.keys_match().map_err(|e| e.to_string())?;
+    Ok(Some(Arc::new(certified)))
+}
 struct Server {
+    certificate: Arc<Certificate>,
     handshakes: Arc<Handshakes>,
     endpoint: Endpoint,
     accepted: AsyncMutex<mpsc::Receiver<Connection>>,
@@ -252,15 +290,7 @@ fn listen(data: &[u8]) -> Result<Arc<Server>, String> {
         .map_err(|e| e.to_string())?
         .parse()
         .map_err(|e: std::net::AddrParseError| e.to_string())?;
-    let mut certs = Vec::new();
-    loop {
-        let cert = blob(&mut b)?;
-        if cert.is_empty() {
-            break;
-        };
-        certs.push(CertificateDer::from(cert.to_vec()));
-    }
-    let key = PrivatePkcs8KeyDer::from(blob(&mut b)?.to_vec());
+    let certificate = Arc::new(Certificate(RwLock::new(certified(&mut b)?)));
     let mut alpn = Vec::new();
     loop {
         let p = blob(&mut b)?;
@@ -269,7 +299,7 @@ fn listen(data: &[u8]) -> Result<Arc<Server>, String> {
         };
         alpn.push(p.to_vec());
     }
-    if !b.is_empty() || certs.is_empty() || alpn.is_empty() {
+    if !b.is_empty() || alpn.is_empty() {
         return Err("invalid TLS configuration".into());
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -277,8 +307,7 @@ fn listen(data: &[u8]) -> Result<Arc<Server>, String> {
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| e.to_string())?
         .with_no_client_auth()
-        .with_single_cert(certs, key.into())
-        .map_err(|e| e.to_string())?;
+        .with_cert_resolver(certificate.clone());
     tls.alpn_protocols = alpn;
     tls.send_tls13_tickets = 0;
     tls.max_early_data_size = 0;
@@ -326,6 +355,7 @@ fn listen(data: &[u8]) -> Result<Arc<Server>, String> {
         pending.abort_all();while pending.join_next().await.is_some(){}
     });
     Ok(Arc::new(Server {
+        certificate,
         handshakes,
         endpoint,
         accepted: AsyncMutex::new(rx),
@@ -337,7 +367,40 @@ fn listen(data: &[u8]) -> Result<Arc<Server>, String> {
 /// Returns the C ABI version implemented by this library.
 #[unsafe(no_mangle)]
 pub extern "C" fn onv_quinn_abi_version() -> u64 {
-    1
+    2
+}
+/// Replaces the certificate a listener presents to handshakes from now on.
+/// Returns 0, -1 for an unknown listener, or -3 with details in the error buffer.
+/// # Safety
+/// Input and output pointers must refer to valid buffers for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn onv_quinn_set_certificate(
+    id: u64,
+    p: *const u8,
+    n: usize,
+    err: *mut u8,
+    cap: usize,
+) -> i64 {
+    boundary(-6, || {
+        let Some(s) = server(id) else {
+            return -1;
+        };
+        let mut b = input(p, n);
+        match certified(&mut b) {
+            Ok(Some(c)) if b.is_empty() => {
+                *s.certificate.0.write().unwrap() = Some(c);
+                0
+            }
+            Ok(_) => {
+                output(err, cap, b"no certificate, or bytes after it");
+                -3
+            }
+            Err(e) => {
+                output(err, cap, e.as_bytes());
+                -3
+            }
+        }
+    })
 }
 /// Binds a server; error details are copied to the caller's error buffer.
 /// # Safety
@@ -626,6 +689,11 @@ mod tests {
         assert_eq!(onv_quinn_close(u64::MAX), 0);
         assert_eq!(onv_quinn_stop(u64::MAX), 0);
         assert_eq!(onv_quinn_accept(u64::MAX, 1), -1);
+        let mut error = [0u8; 16];
+        assert_eq!(
+            unsafe { onv_quinn_set_certificate(u64::MAX, [].as_ptr(), 0, error.as_mut_ptr(), error.len()) },
+            -1
+        );
         let mut b = [0u8; 1];
         assert_eq!(
             unsafe { onv_quinn_read(u64::MAX, b.as_mut_ptr(), b.len(), 1) },

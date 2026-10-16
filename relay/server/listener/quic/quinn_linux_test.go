@@ -149,9 +149,18 @@ func TestQuinnTLSRejectsWrongALPN(t *testing.T) {
 func TestQuinnRejectsUnsupportedTLSConfiguration(t *testing.T) {
 	cfg := testTLSConfig(t)
 	cfg.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &cfg.Certificates[0], nil }
+	t.Setenv(EnvQuinnServerName, "relay.example")
 	_, err := quinnTLSBlob("127.0.0.1:0", cfg)
+	require.Error(t, err, "a certificate both held and fetched is refused")
+	cfg.Certificates = nil
+	t.Setenv(EnvQuinnServerName, "")
+	_, err = quinnTLSBlob("127.0.0.1:0", cfg)
+	require.ErrorContains(t, err, EnvQuinnServerName, "a fetched certificate needs the name it is fetched for")
+	cfg = testTLSConfig(t)
+	cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) { return nil, nil }
+	_, err = quinnTLSBlob("127.0.0.1:0", cfg)
 	require.Error(t, err, "dynamic TLS callbacks cannot be silently ignored")
-	cfg.GetCertificate = nil
+	cfg.GetConfigForClient = nil
 	cfg.ClientAuth = tls.RequireAndVerifyClientCert
 	_, err = quinnTLSBlob("127.0.0.1:0", cfg)
 	require.Error(t, err, "client-auth policy cannot be silently ignored")
@@ -381,4 +390,69 @@ func TestQuinnDatagramLimitFollowsPathMTU(t *testing.T) {
 	got, err := client.ReceiveDatagram(ctx)
 	require.NoError(t, err)
 	require.Equal(t, payload, got)
+}
+
+// The certificate Let's Encrypt fetches: the listener binds before there is
+// one, presents the first fetched, and the next once the fetch returns another.
+func TestQuinnFetchedCertificateIsRenewed(t *testing.T) {
+	if os.Getenv(EnvQuinnLibrary) == "" {
+		t.Skip("explicit native Quinn library required")
+	}
+	t.Setenv(EnvQUICBackend, "quinn")
+	t.Setenv(EnvQuinnServerName, "relay.example")
+	retry, renew := quinnCertificateRetry, quinnCertificateRenew
+	quinnCertificateRetry, quinnCertificateRenew = 50*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { quinnCertificateRetry, quinnCertificateRenew = retry, renew })
+
+	first, second := testTLSConfig(t), testTLSConfig(t)
+	var mu sync.Mutex
+	var current *tls.Certificate
+	var asked []string
+	cfg := &tls.Config{NextProtos: first.NextProtos, GetCertificate: func(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		asked = append(asked, h.ServerName)
+		if current == nil {
+			return nil, errors.New("not issued yet")
+		}
+		return current, nil
+	}}
+	l := &Listener{Address: "127.0.0.1:0", TLSConfig: cfg}
+	require.NoError(t, l.Bind())
+	t.Cleanup(func() {
+		require.NoError(t, l.Shutdown(context.Background()))
+		requireUDPAddressFree(t, l.listener.Addr().String())
+	})
+	dial := func(trusted *tls.Config) error {
+		roots := x509.NewCertPool()
+		cert, err := x509.ParseCertificate(trusted.Certificates[0].Certificate[0])
+		require.NoError(t, err)
+		roots.AddCert(cert)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		c, err := goquic.DialAddr(ctx, l.listener.Addr().String(), &tls.Config{RootCAs: roots, NextProtos: trusted.NextProtos}, &goquic.Config{EnableDatagrams: true})
+		if err == nil {
+			_ = c.CloseWithError(0, "")
+		}
+		return err
+	}
+	require.Error(t, dial(first), "no certificate is presented before one is fetched")
+
+	mu.Lock()
+	current = &first.Certificates[0]
+	mu.Unlock()
+	require.Eventually(t, func() bool { return dial(first) == nil }, 5*time.Second, 50*time.Millisecond)
+
+	mu.Lock()
+	current = &second.Certificates[0]
+	mu.Unlock()
+	require.Eventually(t, func() bool { return dial(second) == nil }, 5*time.Second, 50*time.Millisecond)
+	require.Error(t, dial(first), "the renewed certificate replaced the first")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, asked)
+	for _, name := range asked {
+		require.Equal(t, "relay.example", name)
+	}
 }

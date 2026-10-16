@@ -18,11 +18,24 @@ import (
 	"time"
 
 	"github.com/ebitengine/purego"
+	log "github.com/sirupsen/logrus"
+
 	relaylistener "github.com/netbirdio/netbird/relay/server/listener"
 )
 
 // EnvQuinnLibrary specifies the absolute path to the experimental native backend.
 const EnvQuinnLibrary = "NB_RELAY_QUINN_LIBRARY"
+
+// EnvQuinnServerName is the name a certificate is asked for when the TLS
+// configuration fetches its certificate (Let's Encrypt), not holds it.
+const EnvQuinnServerName = "NB_RELAY_QUINN_SERVER_NAME"
+
+// How often a fetched certificate is asked for again: until there is one, and
+// after (a renewal reaches the listener within an hour).
+var (
+	quinnCertificateRetry = 10 * time.Second
+	quinnCertificateRenew = time.Hour
+)
 
 // Native waits are cancellable; this bounds context cancellation observation.
 const quinnContextQuantum = 50 * time.Millisecond
@@ -37,6 +50,7 @@ type quinnAPI struct {
 	close   func(uint64) int64
 	stop    func(uint64) int64
 	stats   func(*byte, uintptr) int64
+	setCert func(uint64, *byte, uintptr, *byte, uintptr) int64
 }
 
 var quinnLibraries = struct {
@@ -63,7 +77,7 @@ func loadQuinn() (*quinnAPI, error) {
 	symbols := []struct {
 		name   string
 		target any
-	}{{"onv_quinn_abi_version", &version}, {"onv_quinn_listen", &api.listen}, {"onv_quinn_address", &api.address}, {"onv_quinn_accept", &api.accept}, {"onv_quinn_remote", &api.remote}, {"onv_quinn_read", &api.read}, {"onv_quinn_write", &api.write}, {"onv_quinn_close", &api.close}, {"onv_quinn_stop", &api.stop}, {"onv_quinn_stats", &api.stats}}
+	}{{"onv_quinn_abi_version", &version}, {"onv_quinn_listen", &api.listen}, {"onv_quinn_address", &api.address}, {"onv_quinn_accept", &api.accept}, {"onv_quinn_remote", &api.remote}, {"onv_quinn_read", &api.read}, {"onv_quinn_write", &api.write}, {"onv_quinn_close", &api.close}, {"onv_quinn_stop", &api.stop}, {"onv_quinn_stats", &api.stats}, {"onv_quinn_set_certificate", &api.setCert}}
 	for _, symbol := range symbols {
 		address, err := purego.Dlsym(lib, symbol.name)
 		if err != nil {
@@ -72,7 +86,7 @@ func loadQuinn() (*quinnAPI, error) {
 		}
 		purego.RegisterFunc(symbol.target, address)
 	}
-	if version() != 1 {
+	if version() != 2 {
 		_ = purego.Dlclose(lib)
 		return nil, fmt.Errorf("unsupported Quinn bridge ABI")
 	}
@@ -90,33 +104,85 @@ func appendQuinnField(b, field []byte) []byte {
 	b = binary.BigEndian.AppendUint32(b, uint32(len(field)))
 	return append(b, field...)
 }
+
+// appendQuinnCertificate adds a chain and its key, or two empty fields for none.
+func appendQuinnCertificate(b []byte, cert *tls.Certificate) ([]byte, error) {
+	if cert == nil {
+		return appendQuinnField(appendQuinnField(b, nil), nil), nil
+	}
+	key, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("Quinn TLS private key: %w", err)
+	}
+	defer clear(key)
+	if len(cert.Certificate) == 0 {
+		return nil, fmt.Errorf("empty Quinn TLS certificate")
+	}
+	for _, der := range cert.Certificate {
+		if len(der) == 0 {
+			return nil, fmt.Errorf("empty Quinn TLS certificate")
+		}
+		b = appendQuinnField(b, der)
+	}
+	b = appendQuinnField(b, nil)
+	return appendQuinnField(b, key), nil
+}
+
+// quinnFetched says whether the configuration fetches its certificate, and
+// refuses one that both holds and fetches.
+func quinnFetched(cfg *tls.Config) (bool, error) {
+	if cfg.GetCertificate == nil {
+		return false, nil
+	}
+	if len(cfg.Certificates) != 0 {
+		return false, fmt.Errorf("Quinn takes a TLS certificate held or fetched, not both")
+	}
+	if os.Getenv(EnvQuinnServerName) == "" {
+		return false, fmt.Errorf("%s must name the certificate fetched for Quinn", EnvQuinnServerName)
+	}
+	return true, nil
+}
+
+// fetchQuinnCertificate asks the configuration for the certificate of the
+// relay's name, as a handshake naming it would.
+func fetchQuinnCertificate(cfg *tls.Config) (*tls.Certificate, error) {
+	cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{ServerName: os.Getenv(EnvQuinnServerName), SupportedProtos: cfg.NextProtos})
+	if err != nil {
+		return nil, err
+	}
+	if cert == nil {
+		return nil, fmt.Errorf("no certificate for %s", os.Getenv(EnvQuinnServerName))
+	}
+	return cert, nil
+}
+
 func quinnTLSBlob(address string, cfg *tls.Config) ([]byte, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("Quinn requires TLS certificates")
 	}
-	if cfg.GetCertificate != nil || cfg.GetConfigForClient != nil || cfg.VerifyConnection != nil || cfg.VerifyPeerCertificate != nil || cfg.ClientAuth != tls.NoClientCert || len(cfg.CurvePreferences) > 0 {
+	fetched, err := quinnFetched(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.GetConfigForClient != nil || cfg.VerifyConnection != nil || cfg.VerifyPeerCertificate != nil || cfg.ClientAuth != tls.NoClientCert || len(cfg.CurvePreferences) > 0 {
 		return nil, fmt.Errorf("experimental Quinn backend requires static certificates and no custom TLS callbacks or client-auth policy")
 	}
-	if len(cfg.Certificates) != 1 || len(cfg.NextProtos) == 0 {
+	if (!fetched && len(cfg.Certificates) != 1) || len(cfg.NextProtos) == 0 {
 		return nil, fmt.Errorf("experimental Quinn backend requires one certificate chain and explicit ALPN")
 	}
 	if cfg.MaxVersion != 0 && cfg.MaxVersion < tls.VersionTLS13 {
 		return nil, fmt.Errorf("Quinn requires TLS 1.3")
 	}
-	key, err := x509.MarshalPKCS8PrivateKey(cfg.Certificates[0].PrivateKey)
+	// A fetched certificate is given after the bind (refreshQuinnCertificate):
+	// Let's Encrypt may need the TCP listener up to issue it.
+	var held *tls.Certificate
+	if !fetched {
+		held = &cfg.Certificates[0]
+	}
+	b, err := appendQuinnCertificate(appendQuinnField(nil, []byte(address)), held)
 	if err != nil {
-		return nil, fmt.Errorf("Quinn TLS private key: %w", err)
+		return nil, err
 	}
-	defer clear(key)
-	b := appendQuinnField(nil, []byte(address))
-	for _, cert := range cfg.Certificates[0].Certificate {
-		if len(cert) == 0 {
-			return nil, fmt.Errorf("empty Quinn TLS certificate")
-		}
-		b = appendQuinnField(b, cert)
-	}
-	b = appendQuinnField(b, nil)
-	b = appendQuinnField(b, key)
 	for _, alpn := range cfg.NextProtos {
 		if len(alpn) == 0 || len(alpn) > 255 {
 			clear(b)
@@ -132,6 +198,8 @@ type quinnListener struct {
 	id     uint64
 	addr   net.Addr
 	closed atomic.Bool
+	done   chan struct{}
+	wg     sync.WaitGroup
 }
 
 func newQuinnListener(address string, cfg *tls.Config) (sessionListener, error) {
@@ -168,13 +236,68 @@ func newQuinnListener(address string, cfg *tls.Config) (sessionListener, error) 
 		api.stop(id)
 		return nil, err
 	}
-	return &quinnListener{api: api, id: id, addr: addr}, nil
+	l := &quinnListener{api: api, id: id, addr: addr, done: make(chan struct{})}
+	if fetched, _ := quinnFetched(cfg); fetched {
+		l.wg.Add(1)
+		go l.refreshQuinnCertificate(cfg)
+	}
+	return l, nil
+}
+
+// refreshQuinnCertificate gives the listener the certificate the configuration
+// fetches, and gives it again whenever the fetch returns another (a renewal).
+func (l *quinnListener) refreshQuinnCertificate(cfg *tls.Config) {
+	defer l.wg.Done()
+	var given []byte
+	for {
+		wait := quinnCertificateRenew
+		cert, err := fetchQuinnCertificate(cfg)
+		switch {
+		case err != nil:
+			log.Errorf("Quinn certificate for %s: %v", os.Getenv(EnvQuinnServerName), err)
+			if given == nil {
+				wait = quinnCertificateRetry
+			}
+		case !bytes.Equal(cert.Certificate[0], given):
+			if err := l.setCertificate(cert); err != nil {
+				log.Errorf("Quinn certificate for %s: %v", os.Getenv(EnvQuinnServerName), err)
+				if given == nil {
+					wait = quinnCertificateRetry
+				}
+				break
+			}
+			given = bytes.Clone(cert.Certificate[0])
+			log.Infof("Quinn presents the certificate for %s", os.Getenv(EnvQuinnServerName))
+		}
+		select {
+		case <-l.done:
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+func (l *quinnListener) setCertificate(cert *tls.Certificate) error {
+	blob, err := appendQuinnCertificate(nil, cert)
+	if err != nil {
+		return err
+	}
+	defer clear(blob)
+	details := make([]byte, 1024)
+	code := l.api.setCert(l.id, quinnPointer(blob), uintptr(len(blob)), quinnPointer(details), uintptr(len(details)))
+	runtime.KeepAlive(blob)
+	if code != 0 {
+		return fmt.Errorf("Quinn set certificate: %d %s", code, bytes.TrimRight(details, "\x00"))
+	}
+	return nil
 }
 func (l *quinnListener) Addr() net.Addr { return l.addr }
 func (l *quinnListener) Close() error {
 	if l.closed.Swap(true) {
 		return nil
 	}
+	close(l.done)
+	l.wg.Wait()
 	if code := l.api.stop(l.id); code != 0 {
 		return fmt.Errorf("Quinn shutdown: %d", code)
 	}
@@ -220,8 +343,12 @@ type quinnConn struct {
 	closed atomic.Bool
 }
 
-func (c *quinnConn) Read(ctx context.Context, b []byte) (int, error)  { return c.transfer(ctx, b, false) }
-func (c *quinnConn) Write(ctx context.Context, b []byte) (int, error) { return c.transfer(ctx, b, true) }
+func (c *quinnConn) Read(ctx context.Context, b []byte) (int, error) {
+	return c.transfer(ctx, b, false)
+}
+func (c *quinnConn) Write(ctx context.Context, b []byte) (int, error) {
+	return c.transfer(ctx, b, true)
+}
 func (c *quinnConn) transfer(ctx context.Context, b []byte, write bool) (int, error) {
 	for {
 		if c.closed.Load() {
