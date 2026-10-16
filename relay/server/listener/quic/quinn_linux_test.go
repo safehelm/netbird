@@ -472,3 +472,32 @@ func TestQuinnPrefersChaCha20(t *testing.T) {
 		})
 	}
 }
+
+// Each congestion controller the listener can be given carries datagrams, and
+// one it does not know is refused at the bind.
+func TestQuinnCongestionControllers(t *testing.T) {
+	if os.Getenv(EnvQuinnLibrary) == "" {
+		t.Skip("explicit native Quinn library required")
+	}
+	for _, cc := range []string{"newreno", "cubic", "bbr"} {
+		t.Run(cc, func(t *testing.T) {
+			t.Setenv("NB_RELAY_QUINN_CC", cc)
+			l, cfg := nativeQuinnListener(t)
+			client := verifiedGoClient(t, l, cfg)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			server, err := l.listener.Accept(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = server.Close() })
+			require.NoError(t, client.SendDatagram([]byte(cc)))
+			b := make([]byte, 64)
+			n, err := server.Read(ctx, b)
+			require.NoError(t, err)
+			require.Equal(t, cc, string(b[:n]))
+		})
+	}
+	t.Setenv(EnvQUICBackend, "quinn")
+	t.Setenv("NB_RELAY_QUINN_CC", "vegas")
+	l := &Listener{Address: "127.0.0.1:0", TLSConfig: testTLSConfig(t)}
+	require.ErrorContains(t, l.Bind(), "newreno, cubic or bbr")
+}

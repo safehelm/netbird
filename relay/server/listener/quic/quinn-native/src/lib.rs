@@ -350,7 +350,15 @@ fn listen(data: &[u8]) -> Result<Arc<Server>, String> {
     transport
         .datagram_receive_buffer_size(Some(*DATAGRAM_RECV_BYTES))
         .datagram_send_buffer_size(*DATAGRAM_SEND_BYTES);
-    transport.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
+    // NB_RELAY_QUINN_CC: newreno (when unset), cubic or bbr. Each relayed leg
+    // is a QUIC connection of its own, its sending held by this controller;
+    // what it will not send yet waits in the datagram queue
+    match std::env::var("NB_RELAY_QUINN_CC").as_deref() {
+        Ok("bbr") => transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+        Ok("cubic") => transport.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+        Ok("newreno") | Err(_) => transport.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default())),
+        Ok(other) => return Err(format!("NB_RELAY_QUINN_CC={other}: newreno, cubic or bbr")),
+    };
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(transport));
     let _entered = RUNTIME.enter();
