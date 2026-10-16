@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,12 +27,14 @@ import (
 const (
 	bufferSize            = 8820
 	serverResponseTimeout = 8 * time.Second
-	// connChannelSize is the buffered-message capacity per peer connection.
-	// It must cover the bandwidth-delay product of a fast relayed path so
-	// steady-state traffic never blocks the shared read loop: at 300 Mbit/s
-	// and 50 ms RTT the in-flight data is ~1.9 MB ≈ 213 messages. Buffers
-	// come from the client's pool, so idle connections hold none.
-	connChannelSize = 512
+	// defaultConnChannelSize is the buffered-message capacity per peer
+	// connection. It must cover the bandwidth-delay product of a fast relayed
+	// path so steady-state traffic never blocks the shared read loop: at 300
+	// Mbit/s and 50 ms RTT the in-flight data is ~1.9 MB ≈ 213 messages.
+	// Buffers come from the client's pool, so idle connections hold none.
+	defaultConnChannelSize = 512
+	// EnvConnQueue sets it (64 to 65536 messages).
+	EnvConnQueue = "NB_RELAY_CONN_QUEUE"
 
 	// msgChanSendTimeout bounds how long an inbound message may wait for a slot
 	// on a reliable transport before it is dropped. It must stay far below the
@@ -45,6 +49,24 @@ const (
 	// dropLogInterval rate-limits the dropped-message warning.
 	dropLogInterval = 5 * time.Second
 )
+
+// connChannelSize is EnvConnQueue's value, else defaultConnChannelSize. On
+// a datagram transport a message that finds the queue full is dropped at
+// once: the queue is how long the WireGuard side may stall before it loses
+// one (512 is 12 ms at 450 Mbit/s, which a relayed TCP stream read as loss,
+// 16 October 2026).
+var connChannelSize = func() int {
+	v := os.Getenv(EnvConnQueue)
+	if v == "" {
+		return defaultConnChannelSize
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 64 || n > 65536 {
+		log.Warnf("invalid %s value %q, using %d", EnvConnQueue, v, defaultConnChannelSize)
+		return defaultConnChannelSize
+	}
+	return n
+}()
 
 var (
 	ErrConnAlreadyExists = fmt.Errorf("connection already exists")

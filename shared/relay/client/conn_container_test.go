@@ -46,7 +46,7 @@ func TestWriteMsgFastPathNoDrop(t *testing.T) {
 	cc, c := newTestContainer(t, true)
 	defer cc.close(nil)
 
-	const total = connChannelSize * 5
+	total := connChannelSize * 5
 	received := make(chan struct{})
 	go func() {
 		buf := make([]byte, bufferSize)
