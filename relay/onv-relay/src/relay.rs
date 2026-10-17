@@ -67,6 +67,9 @@ pub struct Peer {
     acked: AtomicBool,
     /// Messages read from this peer
     read: AtomicU64,
+    /// Set once its auth response is written: nothing is forwarded to the
+    /// peer before (`forward`)
+    ready: watch::Sender<bool>,
 }
 
 impl Peer {
@@ -122,7 +125,7 @@ impl Relay {
             .map(|p| (p.name.clone(), p.quic.as_ref().unwrap().stats(), p.read.load(Ordering::Relaxed)))
             .collect();
         type Series = (&'static str, &'static str, fn(&quinn::ConnectionStats, u64) -> f64);
-        let series: [Series; 8] = [
+        let series: [Series; 10] = [
             ("relay_quic_datagrams_received", "DATAGRAM frames Quinn received from the peer", |st, _| {
                 st.frame_rx.datagram as f64
             }),
@@ -135,6 +138,12 @@ impl Relay {
             }),
             ("relay_quic_cwnd_bytes", "Congestion window to the peer", |st, _| st.path.cwnd as f64),
             ("relay_quic_rtt_seconds", "Round trip to the peer", |st, _| st.path.rtt.as_secs_f64()),
+            ("relay_quic_mtu_bytes", "The path's MTU to the peer, as discovered (RFC 8899)", |st, _| {
+                st.path.current_mtu as f64
+            }),
+            ("relay_quic_black_holes", "MTU black holes detected on the path to the peer", |st, _| {
+                st.path.black_holes_detected as f64
+            }),
         ];
         for (name, help, get) in series {
             let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge");
@@ -181,16 +190,6 @@ impl Relay {
                 return;
             }
         };
-        // The answer goes before anything another peer sends this one: the
-        // client reads its first message as the answer
-        match tokio::time::timeout(HANDSHAKE_TIMEOUT, a.writer.write(self.auth_response.clone())).await {
-            Ok(Ok(())) => {}
-            e => {
-                error!("failed to send handshake response to {}: {e:?}", a.remote);
-                a.close();
-                return;
-            }
-        }
         let (events, events_rx) = mpsc::unbounded_channel();
         let listener = Arc::new(Listener { interest: Mutex::default(), events });
         let peer = Arc::new(Peer {
@@ -205,6 +204,7 @@ impl Relay {
             acked: AtomicBool::new(false),
             // its auth message, which Quinn counted as received too
             read: AtomicU64::new(1),
+            ready: watch::channel(false).0,
         });
         info!(peer_id = %peer.name, "peer connected from: {}", a.remote);
         self.listeners.write().unwrap().insert(peer.uid, listener);
@@ -215,10 +215,25 @@ impl Relay {
         }
         self.peer_came_online(&id);
         self.metrics.peer_connected(peer.protocol);
-        self.metrics.record_auth_time(started.elapsed());
-
         tokio::spawn(self.clone().health_check(peer.clone()));
         tokio::spawn(notify(peer.clone(), events_rx));
+
+        // Registered first, as the Go relay registers it, so a message sent
+        // to the peer the moment it is said to be online is not lost; and its
+        // answer still goes before anything another peer sends it, which
+        // `forward` holds until `ready`: the client reads its first message as
+        // the answer. (The Go relay registers first too, and forwards at once:
+        // a client there can read another peer's message as its answer)
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, peer.writer.write(self.auth_response.clone())).await {
+            Ok(Ok(())) => {
+                peer.ready.send_replace(true);
+            }
+            e => {
+                error!(peer_id = %peer.name, "failed to send handshake response to {}: {e:?}", a.remote);
+                peer.close();
+            }
+        }
+        self.metrics.record_auth_time(started.elapsed());
         self.read_loop(&peer, a.reader).await;
 
         self.listeners.write().unwrap().remove(&peer.uid);
@@ -313,6 +328,21 @@ impl Relay {
             debug!(peer_id = %peer.name, "peer not found: {}", messages::peer_id_string(&dest));
             return;
         };
+        if !*dp.ready.borrow() {
+            // Its auth response goes first (`accept`)
+            let mut ready = dp.ready.subscribe();
+            let mut closed = dp.closed.subscribe();
+            let ready = tokio::select! {
+                biased;
+                _ = conn::until_closed(&mut closed) => false,
+                r = ready.wait_for(|r| *r) => r.is_ok(),
+            };
+            if !ready {
+                self.metrics.dropped_write_failed.fetch_add(1, Ordering::Relaxed);
+                debug!(peer_id = %peer.name, "failed to write transport message to {}: closed before its answer", dp.name);
+                return;
+            }
+        }
         let out = messages::relabel_transport(msg, &peer.id);
         let n = out.len() as u64;
         match dp.writer.write(out).await {

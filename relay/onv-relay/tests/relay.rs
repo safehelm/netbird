@@ -225,6 +225,44 @@ async fn peer_state_subscription() {
 }
 
 #[tokio::test]
+async fn no_stream_is_offered() {
+    // The protocol is DATAGRAMs alone; with no stream credit (RFC 9000
+    // section 4.6) an open waits for credit that never comes
+    let f = relay(HealthCheckTiming::default()).await;
+    let c = logged_in(&f, "streams", true).await;
+    let Client::Quic { conn, .. } = &c else { unreachable!() };
+    assert!(tokio::time::timeout(Duration::from_secs(1), conn.open_uni()).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(1), conn.open_bi()).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(1), conn.accept_uni()).await.is_err());
+    f.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_peer_is_known_the_moment_it_is_said_online() {
+    // b asked about a; a logs in; b, told a is online, sends at once: a reads
+    // its answer first, then every message, none lost
+    let f = relay(HealthCheckTiming::default()).await;
+    let (ida, idb) = (messages::hash_id("a-known"), messages::hash_id("b-known"));
+    let mut b = logged_in(&f, "b-known", true).await;
+    for m in messages::peer_id_messages(messages::SUBSCRIBE_PEER_STATE, &[ida]) {
+        b.send(&m).await;
+    }
+    let mut a = Client::quic(&f).await;
+    a.send(&messages::auth_message(&ida, &token())).await;
+    assert_eq!(b.recv_timeout().await.unwrap(), messages::peer_id_messages(messages::PEERS_ONLINE, &[ida])[0]);
+    for i in 0..20u32 {
+        b.send(&messages::transport(&ida, &i.to_be_bytes())).await;
+    }
+    assert_eq!(a.recv_timeout().await.unwrap(), messages::auth_response(&f.url));
+    for i in 0..20u32 {
+        assert_eq!(a.recv_timeout().await.unwrap(), Bytes::from(messages::transport(&idb, &i.to_be_bytes())), "#{i}");
+    }
+    let m = f.running.relay.metrics.render();
+    assert!(m.contains("relay_transport_dropped_total{reason=\"no_peer\"} 0\n"), "{m}");
+    f.running.shutdown().await;
+}
+
+#[tokio::test]
 async fn reconnection_closes_the_earlier_connection() {
     let f = relay(HealthCheckTiming::default()).await;
     let mut first = logged_in(&f, "same", true).await;
@@ -316,6 +354,8 @@ async fn health_and_metrics_endpoints() {
     let id = messages::peer_id_string(&messages::hash_id("metrics-a"));
     assert!(body.contains(&format!("relay_quic_datagrams_read{{peer=\"{id}\"}} 1\n")), "{body}");
     assert!(body.contains(&format!("relay_quic_datagrams_received{{peer=\"{id}\"}} 1\n")), "{body}");
+    assert!(body.contains(&format!("relay_quic_mtu_bytes{{peer=\"{id}\"}} 1")), "{body}");
+    assert!(body.contains(&format!("relay_quic_black_holes{{peer=\"{id}\"}} 0\n")), "{body}");
     f.running.shutdown().await;
 }
 

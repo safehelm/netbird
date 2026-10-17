@@ -19,7 +19,12 @@ pub fn transport() -> Result<TransportConfig, String> {
     t.initial_mtu(1232)
         .max_idle_timeout(Some(Duration::from_secs(30).try_into().map_err(|e| format!("{e}"))?))
         .datagram_receive_buffer_size(Some(datagram_bytes("NB_RELAY_QUINN_DATAGRAM_RECV_BYTES", 4 << 20)))
-        .datagram_send_buffer_size(datagram_bytes("NB_RELAY_QUINN_DATAGRAM_SEND_BYTES", 1 << 20));
+        .datagram_send_buffer_size(datagram_bytes("NB_RELAY_QUINN_DATAGRAM_SEND_BYTES", 1 << 20))
+        // The protocol is DATAGRAMs alone (RFC 9221), so no stream is offered
+        // (RFC 9000 section 4.6): none can be opened, and nothing is held for
+        // one. The Go relay offers quic-go's 100 of each and reads none
+        .max_concurrent_bidi_streams(0u32.into())
+        .max_concurrent_uni_streams(0u32.into());
     // NB_RELAY_QUINN_CC: newreno (when unset), cubic or bbr. Each relayed leg
     // is a QUIC connection of its own, its sending held by this controller
     match std::env::var("NB_RELAY_QUINN_CC").as_deref() {
