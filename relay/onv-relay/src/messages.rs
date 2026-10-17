@@ -112,6 +112,21 @@ pub fn transport_destination(msg: &[u8]) -> Option<PeerId> {
     msg.get(HEADER..TRANSPORT_HEADER).map(|id| id.try_into().unwrap())
 }
 
+/// What a transport message's receiver reads first: the header with the
+/// sender's id in the address's place; `transport_payload` follows it. Made
+/// once a peer, and sent before each payload as one message, neither copied
+pub fn transport_label(source: &PeerId) -> Bytes {
+    let mut out = BytesMut::with_capacity(TRANSPORT_HEADER);
+    out.put_slice(&[VERSION, TRANSPORT]);
+    out.put_slice(source);
+    out.freeze()
+}
+
+/// A transport message's payload, a slice of the message as received
+pub fn transport_payload(msg: &Bytes) -> Bytes {
+    msg.slice(TRANSPORT_HEADER.min(msg.len())..)
+}
+
 /// The message as its receiver gets it: the sender's id in the address's place
 pub fn relabel_transport(msg: &[u8], source: &PeerId) -> Bytes {
     let mut out = BytesMut::with_capacity(msg.len());
@@ -191,6 +206,12 @@ mod tests {
         assert_eq!(&out[..2], &[VERSION, TRANSPORT]);
         assert_eq!(transport_destination(&out), Some(a));
         assert_eq!(&out[38..], b"payload");
+        // The two parts the relay sends instead are the same bytes
+        let msg = Bytes::from(msg);
+        let mut parts = BytesMut::from(&transport_label(&a)[..]);
+        parts.put_slice(&transport_payload(&msg));
+        assert_eq!(parts.freeze(), out);
+        assert_eq!(transport_payload(&Bytes::from_static(&[VERSION, TRANSPORT])), Bytes::new());
         assert_eq!(transport_destination(&msg[..37]), None);
     }
 

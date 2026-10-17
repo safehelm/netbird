@@ -1,7 +1,7 @@
 //! One accepted connection, QUIC or WebSocket: its reading half, its writing
 //! half, and the signal that closes it. A message is one QUIC DATAGRAM or one
 //! WebSocket binary message.
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt, stream::SplitStream};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
@@ -87,15 +87,32 @@ impl Writer {
     /// senders, as in the Go relay, rather than losing what they send
     pub async fn write(&self, msg: Bytes) -> Result<(), WriteError> {
         match self {
-            Writer::Quic(c) => c.send_datagram_wait(msg).await.map_err(|e| match e {
-                quinn::SendDatagramError::TooLarge => WriteError::TooLarge,
-                quinn::SendDatagramError::UnsupportedByPeer | quinn::SendDatagramError::Disabled => {
-                    WriteError::Unsupported
-                }
-                quinn::SendDatagramError::ConnectionLost(_) => WriteError::Closed,
-            }),
+            Writer::Quic(c) => c.send_datagram_wait(msg).await.map_err(quic_error),
             Writer::Ws(tx) => tx.send(msg).await.map_err(|_| WriteError::Closed),
         }
+    }
+
+    /// `head` then `data` as one message: over QUIC neither is copied until
+    /// the packet is built (the fork's `send_datagram_parts_wait`); over
+    /// WebSocket they are joined here
+    pub async fn write_parts(&self, head: Bytes, data: Bytes) -> Result<(), WriteError> {
+        match self {
+            Writer::Quic(c) => c.send_datagram_parts_wait(head, data).await.map_err(quic_error),
+            Writer::Ws(tx) => {
+                let mut msg = BytesMut::with_capacity(head.len() + data.len());
+                msg.put_slice(&head);
+                msg.put_slice(&data);
+                tx.send(msg.freeze()).await.map_err(|_| WriteError::Closed)
+            }
+        }
+    }
+}
+
+fn quic_error(e: quinn::SendDatagramError) -> WriteError {
+    match e {
+        quinn::SendDatagramError::TooLarge => WriteError::TooLarge,
+        quinn::SendDatagramError::UnsupportedByPeer | quinn::SendDatagramError::Disabled => WriteError::Unsupported,
+        quinn::SendDatagramError::ConnectionLost(_) => WriteError::Closed,
     }
 }
 

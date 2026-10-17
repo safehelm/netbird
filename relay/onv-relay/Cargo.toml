@@ -14,7 +14,7 @@ path = "src/main.rs"
 # Quinn 0.11.12 with Omnuv's send, seal, receive and decrypt threads
 # (safehelm/quinn, branch onv/0.11.12-relay), pinned by commit: the same
 # Quinn the Go relay's native listener used.
-quinn = { git = "https://github.com/safehelm/quinn", rev = "b2a28f3f64fc71eb93e43362d4239a15b1312baa", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn = { git = "https://github.com/safehelm/quinn", rev = "bf2f422cd0bd60b53513ea019343789878dab38c", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 rustls-pki-types = { version = "1.12", features = ["std"] }
 rustls-native-certs = "0.8"

@@ -59,6 +59,9 @@ pub struct Peer {
     uid: u64,
     id: PeerId,
     name: String,
+    /// The header of a transport message from this peer, as its receiver
+    /// reads it: sent before each payload, which is forwarded as received
+    label: Bytes,
     writer: Writer,
     protocol: &'static str,
     closed: Arc<watch::Sender<bool>>,
@@ -196,6 +199,7 @@ impl Relay {
             uid: self.next_uid.fetch_add(1, Ordering::Relaxed),
             id,
             name: messages::peer_id_string(&id),
+            label: messages::transport_label(&id),
             writer: a.writer.clone(),
             protocol: a.protocol,
             closed: a.closed.clone(),
@@ -317,7 +321,7 @@ impl Relay {
         }
     }
 
-    async fn forward(&self, peer: &Peer, msg: &[u8]) {
+    async fn forward(&self, peer: &Peer, msg: &Bytes) {
         self.metrics.received.fetch_add(msg.len() as u64, Ordering::Relaxed);
         let Some(dest) = messages::transport_destination(msg) else {
             error!(peer_id = %peer.name, "failed to unmarshal transport message: invalid message length");
@@ -343,9 +347,9 @@ impl Relay {
                 return;
             }
         }
-        let out = messages::relabel_transport(msg, &peer.id);
-        let n = out.len() as u64;
-        match dp.writer.write(out).await {
+        let payload = messages::transport_payload(msg);
+        let n = (peer.label.len() + payload.len()) as u64;
+        match dp.writer.write_parts(peer.label.clone(), payload).await {
             Ok(()) => {
                 self.metrics.sent.fetch_add(n, Ordering::Relaxed);
             }
